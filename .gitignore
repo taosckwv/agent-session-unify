@@ -35,6 +35,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# AgentTeams 运行状态（团队内部文件，不入库）
+.agent-teams/
+
 # OS / 编辑器
 .DS_Store
 Thumbs.db
