@@ -18,6 +18,7 @@ export {
   DEFAULT_MAX_FRAME_OUTPUT_BYTES,
   DEFAULT_MAX_FRAME_END_CANDIDATES,
   findFrameStarts,
+  readZstdFrameStructure,
   decodeZstdFrameBytes,
   decodeZstdFrames,
 } from '../core/zstd.js';
@@ -25,6 +26,7 @@ export type {
   FrameDecodeStats,
   FrameDecodeOptions,
   ZstdBytesResult,
+  ZstdFrameStructure,
   ZstdJsonlResult,
 } from '../core/zstd.js';
 

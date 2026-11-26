@@ -12,18 +12,17 @@
  * - 帧与行**不是** 1:1：一个帧可含多行，一行也可能跨帧（实测 1358 帧 → 2544 行），
  *   所以必须「全部帧解码后拼接成整体文本，再按 \n 切行」；逐帧切行会把跨帧的行
  *   撕成两半（R3）；
- * - `zlib.zstdDecompressSync` 一次只解**第一帧**，其后的多余字节被忽略；输入被
- *   截断（不足一整帧）则必然报错。也就是说「以 end 为右界能否解开」对 end 单调：
- *   end < 真实帧尾必失败，end ≥ 真实帧尾必成功且输出的是同一帧。因此真实帧尾 =
- *   能解开的最小右界。
- * - 帧是紧邻的，真实帧尾之前不会再有真帧，于是「按魔数候选升序试解，第一个成功
- *   的候选」就是精确帧尾。但压缩数据内部可能偶然出现魔数（D1 实测整包 .tar.zst
- *   有 7 个假魔数），候选个数不能设成硬上限——否则真帧尾 `bytes.length` 轮不到
- *   （t3 D1）。这里分两步：
- *   1. 快路径：最多试 `maxFrameEndCandidates` 个紧随其后的候选（正常帧 1 次命中）；
- *   2. 慢路径：快路径全失败时，先用 `bytes.length` 证明当前帧完好（多余字节被
- *      忽略），再在「剩余魔数候选 + 文件末尾」中二分最小可解右界，得到精确帧尾。
- *      绝不把 `bytes.length` 当成功答案直接吞掉后续真实帧。
+ * - `zlib.zstdDecompressSync` 一次只解**第一帧**，其后的多余字节被忽略。
+ * - 帧边界**按帧结构算，不靠「能不能解开」猜**：Decoding 的宽容度随 Node 版本变
+ *   （2026-11-26 生产环境 Node 25 实测：截断帧不再抛错，而是静默返回部分文本），
+ *   所以「end < 真实帧尾必失败」这条单调性在 Node 25 上不成立；靠它二分会把
+ *   截断帧当成完整帧、吞掉半帧数据。现在先按 RFC 8878 解出帧头与块头得到精确
+ *   帧尾（`readZstdFrameStructure`），再只解 [帧头, 帧尾) 这一段字节。
+ * - 结构解析不出来（未知变体、撕裂尾帧、异常数据）才回退旧启发式：
+ *   按魔数候选升序试解，第一个成功的候选就是精确帧尾；快路径最多试
+ *   `maxFrameEndCandidates` 个候选，全失败则先用 `bytes.length` 证明当前帧完好，
+ *   再在「剩余候选 + 文件末尾」里二分最小可解右界。绝不把 `bytes.length` 当成功
+ *   答案直接吞掉后续真实帧。
  * - 成功解出一帧后把游标跳到第一个 ≥ 帧尾的魔数位置，帧内假魔数不会重复计入
  *   `failedFrames`。
  *
@@ -102,6 +101,139 @@ export function findFrameStarts(bytes: Uint8Array): number[] {
   return starts;
 }
 
+/** zstd 块最大字节数（RFC 8878 §3.1.1.2.2：Block_Size 上限 128 KiB）。 */
+const ZSTD_MAX_BLOCK_SIZE = 128 * 1024;
+
+/**
+ * 帧结构解析结果（RFC 8878 §3.1）：帧尾是算出来的，不是试出来的。
+ * 只要帧本身完整，`end` 就是下一帧的起点，与 Node 版本无关。
+ */
+export interface ZstdFrameStructure {
+  /** 帧尾（不含），即下一帧起点。 */
+  end: number;
+  /** 帧头字节数（含 4 字节魔数）。 */
+  headerBytes: number;
+  /** 块个数。 */
+  blocks: number;
+  /** 帧尾是否带 4 字节内容校验和（xxh64）。 */
+  checksum: boolean;
+  /** 帧头声明的解压后字节数（未声明则 undefined）。 */
+  declaredContentSize: number | undefined;
+}
+
+/** 小端无符号整数读取；超出安全整数范围返回 undefined（真实帧不可能这么大）。 */
+function readLittleEndian(
+  bytes: Uint8Array,
+  offset: number,
+  size: number,
+): number | undefined {
+  let value = 0;
+  for (let i = size - 1; i >= 0; i -= 1) value = value * 256 + (bytes[offset + i] as number);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
+/**
+ * 帧结构解析的三种结果：算得出帧尾 / 字节不够（截断、撕裂尾帧）/ 结构说不通
+ * （保留位、保留块类型、假魔数）。截断必须与「说不通」分开：前者绝不能交给
+ * 宽松解码器试解，否则 Node 25 会把半帧冒充成整帧（静默丢数据）。
+ */
+type FrameStructureParse =
+  | { status: 'ok'; structure: ZstdFrameStructure }
+  | { status: 'truncated' }
+  | { status: 'invalid' };
+
+/**
+ * 按 RFC 8878 解析 `start` 处的 zstd 帧结构，求出精确帧尾。
+ *
+ * 为什么不用「能解开就算完整」：`zstdDecompressSync` 对截断输入的宽容度随 Node
+ * 版本变（Node 25 实测静默返回部分文本），「能不能解开」不再是帧完整性的判据。
+ * 结构化解析只看字节：魔数 → 帧头描述符（FCS/单段/校验和/字典 ID）→ 块头
+ * （3 字节：last/type/size）→ 可选 4 字节校验和，算出来的 end 就是帧尾。
+ *
+ * 不抛异常（AGENTS：坏帧跳过并计数），由调用方决定怎么计数。
+ */
+function parseZstdFrameStructure(bytes: Uint8Array, start: number): FrameStructureParse {
+  const [m0, m1, m2, m3] = ZSTD_FRAME_MAGIC_BYTES as [number, number, number, number];
+  if (start + 4 > bytes.length) return { status: 'truncated' };
+  if (
+    bytes[start] !== m0 ||
+    bytes[start + 1] !== m1 ||
+    bytes[start + 2] !== m2 ||
+    bytes[start + 3] !== m3
+  ) {
+    return { status: 'invalid' };
+  }
+  let p = start + 4;
+
+  // 帧头描述符（FHD）。
+  if (p >= bytes.length) return { status: 'truncated' };
+  const fhd = bytes[p] as number;
+  p += 1;
+  const fcsFlag = (fhd >> 6) & 3;
+  const singleSegment = ((fhd >> 5) & 1) === 1;
+  const checksum = ((fhd >> 2) & 1) === 1;
+  const dictIdFlag = fhd & 3;
+  if (((fhd >> 4) & 1) === 1) return { status: 'invalid' }; // Unused_bit 必须为 0
+  if (((fhd >> 3) & 1) === 1) return { status: 'invalid' }; // Reserved_bit 必须为 0
+
+  // 非单段帧紧跟 1 字节 Window_Descriptor（内容不校验，只占位）。
+  if (!singleSegment) {
+    if (p >= bytes.length) return { status: 'truncated' };
+    p += 1;
+  }
+
+  const dictIdSize = dictIdFlag === 0 ? 0 : dictIdFlag === 1 ? 1 : dictIdFlag === 2 ? 2 : 4;
+  const fcsSize = fcsFlag === 0 ? (singleSegment ? 1 : 0) : fcsFlag === 1 ? 2 : fcsFlag === 2 ? 4 : 8;
+  if (p + dictIdSize + fcsSize > bytes.length) return { status: 'truncated' };
+  p += dictIdSize;
+
+  let declaredContentSize: number | undefined;
+  if (fcsSize > 0) {
+    const size = readLittleEndian(bytes, p, fcsSize);
+    if (size === undefined) return { status: 'invalid' };
+    // 2 字节形式是「值 - 256」的偏移编码（RFC 8878 §3.1.1.3.1）。
+    declaredContentSize = fcsSize === 2 ? size + 256 : size;
+    p += fcsSize;
+  }
+  const headerBytes = p - start;
+
+  // 块序列：每块 3 字节头（bit0=last，bit1-2=type，bit3+ = size）。
+  let blocks = 0;
+  for (;;) {
+    if (p + 3 > bytes.length) return { status: 'truncated' };
+    const header =
+      (bytes[p] as number) | ((bytes[p + 1] as number) << 8) | ((bytes[p + 2] as number) << 16);
+    p += 3;
+    const last = (header & 1) === 1;
+    const blockType = (header >> 1) & 3;
+    const blockSize = header >>> 3;
+    if (blockType === 3) return { status: 'invalid' }; // Reserved block type
+    if (blockSize > ZSTD_MAX_BLOCK_SIZE) return { status: 'invalid' };
+    blocks += 1;
+    const dataBytes = blockType === 1 ? 1 : blockSize; // RLE 块只有 1 字节实际数据
+    if (p + dataBytes > bytes.length) return { status: 'truncated' };
+    p += dataBytes;
+    if (last) break;
+  }
+  if (checksum) {
+    if (p + 4 > bytes.length) return { status: 'truncated' };
+    p += 4;
+  }
+  return {
+    status: 'ok',
+    structure: { end: p, headerBytes, blocks, checksum, declaredContentSize },
+  };
+}
+
+/** 对外只回答「完整帧的帧尾」；截断与说不通都返回 undefined（区分见内部类型）。 */
+export function readZstdFrameStructure(
+  bytes: Uint8Array,
+  start: number,
+): ZstdFrameStructure | undefined {
+  const parsed = parseZstdFrameStructure(bytes, start);
+  return parsed.status === 'ok' ? parsed.structure : undefined;
+}
+
 /** 解码结果：逐帧原始字节 + 帧级统计（tar 解包等二进制场景用）。 */
 export interface ZstdBytesResult {
   /** 全部成功帧的解压输出，按容器顺序。 */
@@ -153,16 +285,52 @@ export function decodeZstdFrameBytes(
     let decoded: Uint8Array | undefined;
     let end = start;
 
-    // 快路径：紧随其后的魔数候选里，第一个能整帧解开的右界就是精确帧尾
-    // （真帧尾之前的假魔数只会切出截断帧而失败）。
-    const fastLast = Math.min(k + maxFrameEndCandidates, starts.length - 1);
-    for (let j = k + 1; j <= fastLast; j += 1) {
-      const candidate = starts[j] as number;
-      const result = tryDecodeZstdFrame(bytes, start, candidate, maxFrameOutputBytes);
-      if (result !== undefined) {
+    // 首选：按帧结构算精确帧尾，只解 [头, 尾) 这一段。与解码器宽容度无关，
+    // 所以截断帧不会被「解出一半文本」冒充成完整帧（Node 25 实测行为）。
+    const parsed = parseZstdFrameStructure(bytes, start);
+    const structure = parsed.status === 'ok' ? parsed.structure : undefined;
+    if (parsed.status === 'truncated') {
+      // 结构明确说「字节不够」：计坏帧，绝不回退到试解（宽容解码器会吞半帧）。
+      failedFrames += 1;
+      k += 1;
+      continue;
+    }
+    if (structure !== undefined && structure.end <= bytes.length) {
+      const result = tryDecodeZstdFrame(bytes, start, structure.end, maxFrameOutputBytes);
+      if (
+        result !== undefined &&
+        // 帧头声明了大小就核对：对不上说明这一帧本身不可信（计数跳过，不吞半帧）。
+        (structure.declaredContentSize === undefined ||
+          result.length === structure.declaredContentSize)
+      ) {
         decoded = result;
-        end = candidate;
-        break;
+        end = structure.end;
+      }
+    }
+
+    // 结构解析出了帧（含「被截断」——end 超出文件）但解不开或声明大小不符：
+    // 按坏帧跳过。这一步很关键：不能让 Node 25 的宽松解码器把半帧冒充成整帧。
+    if (decoded === undefined && structure !== undefined) {
+      failedFrames += 1;
+      k += 1;
+      continue;
+    }
+
+    // 回退路径用的候选预算（快路径与慢路径都要用，故声明在块外）。
+    const fastLast = Math.min(k + maxFrameEndCandidates, starts.length - 1);
+
+    if (decoded === undefined) {
+      // 回退（仅当结构解析不出来时走到这里）：未知变体/假魔数/结构不完整的帧，
+      // 沿用试解启发式。快路径：紧随其后的魔数候选里，第一个能整帧解开的右界
+      // 就是精确帧尾（真帧尾之前的假魔数只会切出截断帧而失败）。
+      for (let j = k + 1; j <= fastLast; j += 1) {
+        const candidate = starts[j] as number;
+        const result = tryDecodeZstdFrame(bytes, start, candidate, maxFrameOutputBytes);
+        if (result !== undefined) {
+          decoded = result;
+          end = candidate;
+          break;
+        }
       }
     }
 

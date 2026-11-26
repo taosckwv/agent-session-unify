@@ -15,6 +15,7 @@ import {
   decodeZstdFrameBytes,
   decodeZstdFrames,
   findFrameStarts,
+  readZstdFrameStructure,
   readZstdJsonl,
   ZSTD_FRAME_MAGIC_BYTES,
   ZSTD_FRAME_MAGIC_HEX,
@@ -286,6 +287,107 @@ describe('帧尾探测：假魔数多于候选上限时仍取到精确帧尾（t
     expect(result.text).toBe('ok\n');
     expect(result.stats.frames).toBe(1);
     expect(result.stats.failedFrames).toBe(6);
+  });
+});
+
+describe('帧结构解析（readZstdFrameStructure）', () => {
+  /** 手写单段帧：raw 块（type 0）或 RLE 块（type 1），可选 4 字节校验和。 */
+  function handBuiltFrame(
+    decompressed: Buffer,
+    options: { rle?: boolean; checksum?: boolean; declaredSize?: number } = {},
+  ): Buffer {
+    const rle = options.rle === true;
+    const declaredSize = options.declaredSize ?? decompressed.length;
+    // 单段位 + （可选）校验和位；FCS 取 1 字节形式。
+    const fhd = (1 << 5) | (options.checksum === true ? 1 << 2 : 0);
+    const blockHeader = (decompressed.length << 3) | ((rle ? 1 : 0) << 1) | 1; // last=1
+    const blockData = rle ? Buffer.from([decompressed[0] ?? 0]) : decompressed;
+    const checksumBytes = options.checksum === true ? Buffer.alloc(4) : Buffer.alloc(0);
+    return Buffer.concat([
+      Buffer.from(ZSTD_FRAME_MAGIC_BYTES),
+      Buffer.from([fhd, declaredSize]),
+      Buffer.from([blockHeader & 0xff, (blockHeader >>> 8) & 0xff, (blockHeader >>> 16) & 0xff]),
+      blockData,
+      checksumBytes,
+    ]);
+  }
+
+  it('压缩帧：结构算出的帧尾就是文件末尾', () => {
+    const frame = zstdCompressSync(Buffer.from('{"a":1}\n'));
+    const structure = readZstdFrameStructure(frame, 0);
+    expect(structure).toBeDefined();
+    expect(structure!.end).toBe(frame.length);
+    expect(structure!.headerBytes).toBeGreaterThanOrEqual(5);
+    expect(structure!.blocks).toBeGreaterThanOrEqual(1);
+    expect(structure!.checksum).toBe(false);
+    // 声明了大小就必须等于原文长度（没声明也合法）。
+    if (structure!.declaredContentSize !== undefined) {
+      expect(structure!.declaredContentSize).toBe(Buffer.byteLength('{"a":1}\n'));
+    }
+  });
+
+  it('手写 raw 块帧：帧尾精确，解出原文', () => {
+    const frame = handBuiltFrame(Buffer.from('abc'));
+    expect(readZstdFrameStructure(frame, 0)).toEqual({
+      end: frame.length,
+      headerBytes: 6,
+      blocks: 1,
+      checksum: false,
+      declaredContentSize: 3,
+    });
+    expect(decodeZstdFrames(frame)).toEqual({ text: 'abc', stats: { frames: 1, failedFrames: 0 } });
+  });
+
+  it('手写 RLE 块帧：块数据只占 1 字节，帧尾不按解压长度算', () => {
+    const frame = handBuiltFrame(Buffer.from('aaaa'), { rle: true });
+    const structure = readZstdFrameStructure(frame, 0);
+    expect(structure!.blocks).toBe(1);
+    expect(structure!.end).toBe(frame.length);
+    expect(decodeZstdFrames(frame).text).toBe('aaaa');
+  });
+
+  it('带校验和的帧：帧尾含 4 字节校验和；缺这 4 字节按坏帧计、不吐半帧', () => {
+    const frame = handBuiltFrame(Buffer.from('ok'), { checksum: true });
+    const structure = readZstdFrameStructure(frame, 0);
+    expect(structure!.checksum).toBe(true);
+    expect(structure!.end).toBe(frame.length);
+
+    const torn = frame.subarray(0, frame.length - 4);
+    expect(readZstdFrameStructure(torn, 0)).toBeUndefined();
+    expect(decodeZstdFrames(torn)).toEqual({ text: '', stats: { frames: 0, failedFrames: 1 } });
+  });
+
+  it('块中途截断：结构明确报「字节不够」，整帧计坏帧（关键：不交给宽容解码器）', () => {
+    const frame = handBuiltFrame(Buffer.from('hello world'));
+    const torn = frame.subarray(0, frame.length - 1);
+    expect(readZstdFrameStructure(torn, 0)).toBeUndefined();
+    expect(decodeZstdFrames(torn)).toEqual({ text: '', stats: { frames: 0, failedFrames: 1 } });
+  });
+
+  it('帧内自带魔数的 raw 块：帧尾按结构算，不把 payload 里的魔数当新帧', () => {
+    const payload = Buffer.concat([
+      Buffer.from('a'),
+      Buffer.from(ZSTD_FRAME_MAGIC_BYTES),
+      Buffer.from('b'),
+    ]);
+    const frame = handBuiltFrame(payload);
+    expect(readZstdFrameStructure(frame, 0)!.end).toBe(frame.length);
+
+    const two = concatBytes(frame, handBuiltFrame(Buffer.from('next')));
+    // 魔数扫描会把 payload 里的假魔数也算进来（3 个起点），解码必须按结构跳过它。
+    expect(findFrameStarts(two).length).toBe(3);
+    const result = decodeZstdFrameBytes(two);
+    expect(result.stats).toEqual({ frames: 2, failedFrames: 0 });
+    expect(Buffer.from(result.chunks[0] as Uint8Array).equals(payload)).toBe(true);
+    expect(Buffer.from(result.chunks[1] as Uint8Array).toString()).toBe('next');
+  });
+
+  it('帧头声明的大小与解出长度不符：计坏帧，不吞半帧', () => {
+    const frame = handBuiltFrame(Buffer.from('abc'), { declaredSize: 5 });
+    expect(readZstdFrameStructure(frame, 0)!.declaredContentSize).toBe(5);
+    const result = decodeZstdFrames(frame);
+    expect(result.text).toBe('');
+    expect(result.stats).toEqual({ frames: 0, failedFrames: 1 });
   });
 });
 
