@@ -17,6 +17,8 @@ import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { main } from '../../src/index.js';
 import { ccPrompt } from '../fixtures/cc.js';
+import { buildTar, buildTarZstd } from '../fixtures/tar.js';
+import { writeSessionFile } from '../dsh/synthetic.js';
 import {
   assertOutputInvariants,
   loadOutputDir,
@@ -185,8 +187,8 @@ describe('CLI 输入分发：重写副本与空树', () => {
     expect(stats.get('asu.stats.skipped_records')?.stringValue).toBe('2');
   });
 
-  it('目录只展开直接子文件，不递归子目录', () => {
-    const work = workDir('asu-int-cli-norecurse-');
+  it('目录递归展开子目录，主会话与子代理各出一个输出', () => {
+    const work = workDir('asu-int-cli-recurse-');
     const ccDir = join(work, 'cc');
     const nested = join(ccDir, 'nested');
     mkdirSync(nested, { recursive: true });
@@ -199,7 +201,116 @@ describe('CLI 输入分发：重写副本与空树', () => {
     const outDir = join(work, 'out');
     const { code, stdout } = runMain(['parse', ccDir, '--out', outDir]);
     expect(code).toBe(0);
-    expect(stdout).toContain('完成：1 个会话');
-    expect(loadOutputDir(outDir)).toHaveLength(1);
+    expect(stdout).toContain('完成：2 个会话');
+    const files = loadOutputDir(outDir);
+    expect(files).toHaveLength(2);
+    for (const file of files) assertOutputInvariants(file);
+  });
+});
+
+describe('CLI 归档输入：.tar.zst 一次还原主会话与子代理', () => {
+  it('归档里的主会话 + subagents 全部解析，tool-results 跳过', () => {
+    const work = workDir('asu-int-cli-tarzst-');
+    const mainLine = JSON.stringify(
+      ccPrompt([{ type: 'text', text: '主会话' }], {
+        uuid: 'u1',
+        timestamp: '2026-11-25T03:00:00.000Z',
+        extra: { sessionId: 'packed-session' },
+      }),
+    );
+    const subLine = JSON.stringify(
+      ccPrompt([{ type: 'text', text: '子代理' }], {
+        uuid: 'u2',
+        timestamp: '2026-11-25T03:00:01.000Z',
+        extra: { sessionId: 'packed-session', isSidechain: true, agentId: 'a1' },
+      }),
+    );
+    const archivePath = join(work, 'packed-session.tar.zst');
+    writeFileSync(
+      archivePath,
+      buildTarZstd([
+        { name: 'packed-session.jsonl', content: `${mainLine}\n` },
+        { name: 'packed-session/subagents/agent-a1.jsonl', content: `${subLine}\n` },
+        { name: 'packed-session/tool-results/ignored.txt', content: '不是会话' },
+      ]),
+    );
+    const outDir = join(work, 'out');
+    const { code, stdout } = runMain(['parse', archivePath, '--out', outDir]);
+    expect(code).toBe(0);
+    expect(stdout).toContain('完成：2 个会话');
+    const files = loadOutputDir(outDir);
+    expect(files).toHaveLength(2);
+    const labels = files.map((file) => file.relPath);
+    expect(labels.some((label) => label.endsWith('__main.json'))).toBe(true);
+    expect(labels.some((label) => label.includes('sidechain-a1'))).toBe(true);
+    for (const file of files) assertOutputInvariants(file);
+  });
+
+  it('目录里混放归档与普通会话，两者都展开', () => {
+    const work = workDir('asu-int-cli-mixed-');
+    const input = join(work, 'input');
+    mkdirSync(input, { recursive: true });
+    writeCcSessionFile(input, [
+      ccPrompt([{ type: 'text', text: '普通文件' }], {
+        uuid: 'u1',
+        timestamp: '2026-11-25T03:00:00.000Z',
+        extra: { sessionId: 'plain-session' },
+      }),
+    ], 'plain.jsonl');
+    const archivedLine = JSON.stringify(
+      ccPrompt([{ type: 'text', text: '归档里' }], {
+        uuid: 'u2',
+        timestamp: '2026-11-25T03:00:01.000Z',
+        extra: { sessionId: 'archived-session' },
+      }),
+    );
+    writeFileSync(
+      join(input, 'archived.tar.zst'),
+      buildTarZstd([{ name: 'archived-session.jsonl', content: `${archivedLine}\n` }]),
+    );
+    const outDir = join(work, 'out');
+    const { code, stdout } = runMain(['parse', input, '--out', outDir]);
+    expect(code).toBe(0);
+    expect(stdout).toContain('完成：2 个会话');
+    expect(loadOutputDir(outDir)).toHaveLength(2);
+  });
+
+  it('损坏的归档 → 2，不写输出', () => {
+    const work = workDir('asu-int-cli-badarchive-');
+    const archivePath = join(work, 'broken.tar.zst');
+    const bytes = buildTarZstd([{ name: 'a.jsonl', content: '{}\n' }]);
+    bytes[bytes.length - 1] = (bytes[bytes.length - 1] as number) ^ 0xff;
+    writeFileSync(archivePath, bytes);
+    const outDir = join(work, 'out');
+    const { code, stderr } = runMain(['parse', archivePath, '--out', outDir]);
+    expect(code).toBe(2);
+    expect(stderr).toMatch(/解包失败|zstd|帧/);
+    expect(existsSync(outDir), '解包失败时不应创建输出目录').toBe(false);
+  });
+
+  it('归档里没有 .jsonl → 2', () => {
+    const work = workDir('asu-int-cli-nojsonl-');
+    const archivePath = join(work, 'notes.tar');
+    writeFileSync(archivePath, buildTar([{ name: 'readme.md', content: '没有会话' }]));
+    const { code, stderr } = runMain(['parse', archivePath, '--out', join(work, 'out')]);
+    expect(code).toBe(2);
+    expect(stderr).toMatch(/没有 \.jsonl|没有会话/);
+  });
+});
+
+describe('CLI 递归时按目录各取最高版本', () => {
+  it('两个 DSH 会话目录分别取 v4 与 v3，互不覆盖', () => {
+    const work = workDir('asu-int-cli-dsh-versions-');
+    const dirA = join(work, 'session-a');
+    const dirB = join(work, 'session-b');
+    mkdirSync(dirA, { recursive: true });
+    mkdirSync(dirB, { recursive: true });
+    writeSessionFile(dirA, { id: 'sess-a', version: 4, events: [] });
+    writeSessionFile(dirB, { id: 'sess-b', version: 3, events: [] });
+    const outDir = join(work, 'out');
+    const { code, stdout } = runMain(['parse', work, '--out', outDir]);
+    expect(code).toBe(0);
+    expect(stdout).toContain('完成：2 个会话');
+    expect(loadOutputDir(outDir)).toHaveLength(2);
   });
 });

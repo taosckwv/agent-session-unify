@@ -27,9 +27,11 @@
 import { readdirSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
+  asSessionSource,
   emptyStats,
   msToUnixNano,
   type SessionNode,
+  type SessionSource,
   type SourceRef,
   type Stats,
   type StepNode,
@@ -380,6 +382,17 @@ export function pickHighestVersionSessionFile(paths: readonly string[]): string 
 }
 
 /**
+ * 把调用方传的输入规范化成会话来源（t1 裁决 R4）：`physicalPath` 是真正要读的
+ * 文件（目录则取其中最高版本文件，DESIGN §7：不做自动扫盘）；`logicalPath` 进
+ * 一切输出。字符串入参照旧语义，phys == logical（既有调用方零改动）。
+ */
+export function resolveSessionSource(source: string | SessionSource): SessionSource {
+  if (typeof source !== 'string') return source;
+  const physicalPath = resolveSessionInput(source);
+  return { physicalPath, logicalPath: physicalPath };
+}
+
+/**
  * 把调用方传的输入路径规范化成一个会话文件：目录则取其中最高版本文件，
  * 文件则原样返回（DESIGN §7：不做自动扫盘，目录内选择按版本规则）。
  */
@@ -415,8 +428,11 @@ function sessionIdFromFileName(path: string): string {
 // 读文件：容器解码 + 逐行解析（不判版）
 // ---------------------------------------------------------------------------
 
-function readSessionFile(path: string, options: FrameDecodeOptions): RawSessionFile {
-  const decoded = readZstdJsonl(path, options);
+function readSessionFile(
+  source: SessionSource,
+  options: FrameDecodeOptions,
+): RawSessionFile {
+  const decoded = readZstdJsonl(source.physicalPath, options);
   const lines = decoded.text.split('\n');
   const records: ParsedRecord[] = [];
   let inputRecords = 0;
@@ -460,12 +476,12 @@ function readSessionFile(path: string, options: FrameDecodeOptions): RawSessionF
       record: parsed,
       data: isJsonObject(dataValue) ? dataValue : undefined,
       line: index + 1,
-      file: path,
+      file: source.logicalPath,
     });
   }
 
   return {
-    path,
+    path: source.logicalPath,
     header,
     headerVersion,
     headerLine,
@@ -1227,9 +1243,13 @@ function identityOf(raw: RawSessionFile): SessionGroupKey {
 /**
  * 解析一个 DSH 会话文件（或会话目录，取其中最高版本文件）→ 一棵会话树。
  * 坏行/坏帧/撕裂尾帧/未知事件只计数不抛；文件 IO 错误照常抛（调用方路径问题）。
+ * 来源契约同 `resolveSessionSource`：物理只读盘，逻辑进输出（R4）。
  */
-export function parseDshSession(path: string, options: DshParseOptions = {}): SessionNode {
-  const resolved = resolveSessionInput(path);
+export function parseDshSession(
+  source: string | SessionSource,
+  options: DshParseOptions = {},
+): SessionNode {
+  const resolved = resolveSessionSource(source);
   const raw = readSessionFile(resolved, options);
   return buildSessionTree([raw]);
 }
@@ -1244,19 +1264,21 @@ export function parseDshSession(path: string, options: DshParseOptions = {}): Se
  * 单文件入口 `parseDshSession` 保持严格：IO 错误照常抛，方便 CLI 判路径问题。
  */
 export function parseDshSessions(
-  paths: readonly string[],
+  sources: readonly (string | SessionSource)[],
   options: DshParseOptions = {},
 ): SessionNode[] {
   const errorTrees: Array<{ order: number; tree: SessionNode }> = [];
   const groups = new Map<string, RawSessionFile[]>();
   const groupOrder = new Map<string, number>();
 
-  paths.forEach((path, order) => {
+  sources.forEach((source, order) => {
     let raw: RawSessionFile;
     try {
-      raw = readSessionFile(resolveSessionInput(path), options);
+      raw = readSessionFile(resolveSessionSource(source), options);
     } catch (error) {
-      errorTrees.push({ order, tree: buildFileErrorTree(path, error) });
+      // 错误树写逻辑路径：归档成员的临时目录名不得进输出（R4/R7）。
+      const logical = asSessionSource(source).logicalPath;
+      errorTrees.push({ order, tree: buildFileErrorTree(logical, error) });
       return;
     }
     const identity = identityOf(raw);

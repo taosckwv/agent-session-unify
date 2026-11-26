@@ -39,7 +39,14 @@ function tempDir(): string {
 }
 
 afterAll(() => {
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  // t6 F7：Windows 上句柄释放有延迟，用重试清理；失败只吞掉，不影响断言结果。
+  for (const dir of tempDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      // 清理尽力而为。
+    }
+  }
 });
 
 /** 读输出文件的 span 列表（tracesData → resourceSpans[0].scopeSpans[0].spans）。 */

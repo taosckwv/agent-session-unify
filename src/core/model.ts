@@ -38,6 +38,27 @@ export interface SourceRef {
 }
 
 /**
+ * 会话文件来源（t1 裁决 R4）：物理路径只用于读盘，逻辑路径进一切输出。
+ *
+ * 归档先解到 `mkdtemp` 临时目录，物理路径带随机目录名；解析器若把物理路径写进
+ * `extras.sessionFile`、agentLabel hash 种子或错误树，同一归档两次运行就会输出
+ * 不同字节并泄漏本机临时路径。约定：
+ * - `index` 是逻辑路径的唯一生产者：直接文件/目录参数原样保留，
+ *   归档成员为 `` `${归档参数}!/${成员相对路径}` ``（'/' 分隔）；
+ * - 解析器只消费：读 `physicalPath`，写 `logicalPath`；
+ * - 字符串入参等价于 phys == logical（既有调用方零改动）。
+ */
+export interface SessionSource {
+  readonly physicalPath: string;
+  readonly logicalPath: string;
+}
+
+/** 归一化会话来源：字符串视为 phys == logical。 */
+export function asSessionSource(value: string | SessionSource): SessionSource {
+  return typeof value === 'string' ? { physicalPath: value, logicalPath: value } : value;
+}
+
+/**
  * usage 统一口径（t1 裁决 R1；DSH §5 与 CC 实测字段名对齐）。
  *
  * - 全部非负整数；缺失 = 没有该数据，不填 0（AGENTS 禁零填充）；

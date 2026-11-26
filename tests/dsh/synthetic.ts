@@ -10,7 +10,7 @@
  * 保证「毫秒 → 纳秒」路径走的是真实数值范围而不是玩具值。
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
@@ -18,9 +18,29 @@ import { zstdCompressSync } from 'node:zlib';
 /** 毫秒基准：2025-11-23T00:00:00Z（13 位，Number 安全）。 */
 export const BASE_MS = 1763856000000;
 
+/** 已建的临时目录（t6 F7：测试结束统一清理，别把 %TEMP% 塞满 `asu-dsh-*`）。 */
+const sessionDirs: string[] = [];
+
 /** 造一个临时目录（每个用例独立，避免互相污染与并发冲突）。 */
 export function makeSessionDir(): string {
-  return mkdtempSync(join(tmpdir(), 'asu-dsh-'));
+  const dir = mkdtempSync(join(tmpdir(), 'asu-dsh-'));
+  sessionDirs.push(dir);
+  return dir;
+}
+
+/**
+ * 清理 `makeSessionDir` 建过的全部临时目录，供测试文件的 `afterAll` 调用。
+ * Windows 上文件句柄释放有延迟，用 `maxRetries`+`retryDelay` 重试；清理失败
+ * 只吞掉（不掩盖真正的断言失败）。
+ */
+export function cleanupSessionDirs(): void {
+  for (const dir of sessionDirs.splice(0)) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      // 清理尽力而为：残留不该让测试变红。
+    }
+  }
 }
 
 /** 把若干段文本（或原始字节）各自压成一帧，首尾相接成多帧 zstd 容器。 */

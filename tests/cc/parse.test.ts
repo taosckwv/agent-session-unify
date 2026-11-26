@@ -979,4 +979,36 @@ describe('parseCcSession：文件入口与重写副本跳过', () => {
     expect(tree.sessionId).toBe('sess-1');
     assertConservation(tree);
   });
+
+  it('SessionSource：物理路径只读盘，逻辑路径进输出，label 不随临时目录变化（R4）', () => {
+    // 同一逻辑成员的两次物理落点（不同 mkdtemp 目录）必须产出同一个 label：
+    // hash 种子若用物理路径，归档两次运行就会得到不同文件名（R6 根因）。
+    const longStem = `agent-${'y'.repeat(60)}`;
+    const lines = [
+      JSON.stringify(userRecord('u1', 'sub task', { extra: { isSidechain: true } })),
+      JSON.stringify(
+        assistantRecord({
+          uuid: 'a1',
+          blocks: [{ type: 'text', text: 'x' }],
+          stopReason: 'end_turn',
+          extra: { isSidechain: true },
+        }),
+      ),
+    ];
+    const logical = `C:\\in\\pack.tar.zst!/packed/subagents/${longStem}.jsonl`;
+    const first = parseCcSession({
+      physicalPath: tempFile(`${longStem}.jsonl`, lines),
+      logicalPath: logical,
+    });
+    const second = parseCcSession({
+      physicalPath: tempFile(`${longStem}.jsonl`, lines),
+      logicalPath: logical,
+    });
+
+    expect(first.extras['sessionFile']).toBe(logical);
+    expect(first.extras['agentLabelSource']).toBe('fileStem');
+    expect(first.agentLabel.startsWith('sidechain-')).toBe(true);
+    expect(first.agentLabel).toBe(second.agentLabel);
+    expect(first.extras['sessionFile']).not.toContain('asu-cc-parse-');
+  });
 });

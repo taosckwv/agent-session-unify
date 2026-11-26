@@ -21,18 +21,36 @@
  * ids/spanBuilder/otlp 的确定性保证，本层只做编排，顺序 = 路径给定顺序。
  *
  * 用法（DESIGN §7）：`parse <文件或目录路径...> [--out <目录>]`（默认 data/unified/）。
- * 纯手动传路径：不做自动发现、不主动扫盘；目录参数只取其直接子文件里的会话文件
- * （DSH 按 DESIGN §5 只读最高 vN）。
+ * 纯手动传路径：不做自动发现、不主动扫盘；目录参数**递归**展开，会话文件
+ * （DSH `.zstd`、CC `.jsonl`）与归档（`.tar.zst`/`.tar.gz`/`.tgz`/`.tar`）都收；
+ * 归档先解到临时目录再扫，DSH 按「同一目录只读最高 vN」分组（DESIGN §5）。
  */
 
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseCcSession } from './cc/parse.js';
 import { buildSpans } from './core/spanBuilder.js';
+import {
+  ArchiveExtractionError,
+  extractArchive,
+  isArchivePath,
+  type ArchivePartialStats,
+} from './core/archive.js';
 import { serializeTracesData, writeSessionFile } from './core/otlp.js';
 import { parseDshSessions, pickHighestVersionSessionFile, sessionFileVersion } from './dsh/parse.js';
-import { emptyStats, type SessionNode } from './core/model.js';
+import { emptyStats, asSessionSource, type SessionNode, type SessionSource } from './core/model.js';
 
 /** CLI 版本（package.json version 的镜像；tests/smoke.test.ts 断言其形状）。 */
 export const VERSION = '0.1.0';
@@ -58,6 +76,9 @@ const CC_EXTENSION = '.jsonl';
 
 /** 同名冲突后缀起点（otlp.ts sanitizeFileComponent 钦定本层兜底）。 */
 const NAME_COLLISION_SUFFIX_START = 2;
+
+/** 目录递归深度上限（防止符号链接环/异常深目录；正常会话远小于此）。 */
+const MAX_WALK_DEPTH = 64;
 
 /** 终端摘要里「跳过」字段的语义名（§7 摘要行：跳过与丢弃计数）。 */
 const SUMMARY_LABELS = {
@@ -128,69 +149,311 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs | ParsedArgsEr
 }
 
 // ---------------------------------------------------------------------------
-// 路径分派（按扩展名与内容；目录只看直接子文件，不递归）
+// 路径分派（按扩展名与内容；目录递归展开）
 // ---------------------------------------------------------------------------
 
-/** 一个输入路径展开后的分派组（目录可能同时产出 DSH 组与 CC 组）。 */
+/**
+ * 一个输入路径展开后的分派组（目录可能同时产出 DSH 组与 CC 组）。
+ * 文件用 `SessionSource`：物理路径读盘，逻辑路径进输出（R4），归档成员因此
+ * 不会把 mkdtemp 临时目录写进结果。
+ */
 interface DispatchGroup {
   kind: 'dsh' | 'cc';
-  files: string[];
+  files: SessionSource[];
 }
 
-/** 一个输入路径的展开结果：0..n 个分派组，或一条输入错误。 */
+/** 一个归档的终端对账信息（R13：条目数不再丢弃）。 */
+export interface ArchiveReport {
+  /** 归档的逻辑路径（输出用；不含临时目录）。 */
+  logicalPath: string;
+  /** 解出的 `.jsonl` 数。 */
+  extracted: number;
+  /** 跳过的条目数（非会话文件、目录、链接等）。 */
+  skippedEntries: number;
+  /**
+   * 归档内内容条目总数（不含 PAX/GNU 扩展头）= 解出 + 跳过，
+   * 终端摘要按此对账（t6 F1）。
+   */
+  entries: number;
+  /** 解包失败：此时上面三项是已读到的部分统计（t5 对账）。 */
+  failed?: boolean;
+}
+
+/** 一个输入路径的展开结果：0..n 个分派组、0..n 个归档报告、0..n 条输入错误。 */
 interface DispatchResult {
   groups: DispatchGroup[];
-  error?: string;
+  archives: ArchiveReport[];
+  errors: string[];
+  /** 因「已处理过」而跳过的归档数（重复参数去重，不重复计数，t5 D2）。 */
+  skippedDuplicates?: number;
+}
+
+/** 目录递归扫描的中间结果。 */
+interface CollectedSessions {
+  /** 逻辑目录 → 该目录下的 DSH 会话文件（同一目录只取最高 vN）。 */
+  dshByDir: Map<string, SessionSource[]>;
+  /** CC 会话文件（每个文件各自成树）。 */
+  ccFiles: SessionSource[];
+  /** 扫描到的归档，稍后解包。 */
+  archives: SessionSource[];
+}
+
+function emptyCollected(): CollectedSessions {
+  return { dshByDir: new Map(), ccFiles: [], archives: [] };
+}
+
+/**
+ * 递归收集目录下的会话文件与归档。
+ * - 不跟符号链接（避免环、避免把链接目标写出去）；
+ * - 字典序展开，保证确定性；
+ * - 归档先只记路径，由调用方统一解包（解包要临时目录）；
+ * - `logicalArchive` 用于归档解出的临时目录：成员逻辑路径为
+ *   `` `${归档参数}!/${成员相对路径}` ``，物理临时前缀不参与任何输出（R4）。
+ */
+function walkSessions(
+  root: string,
+  collected: CollectedSessions,
+  depth: number,
+  logicalArchive?: string,
+  memberPrefix = '',
+): void {
+  if (depth > MAX_WALK_DEPTH) return;
+  const names = readdirSync(root).sort();
+  for (const name of names) {
+    const entry = join(root, name);
+    let info;
+    try {
+      info = lstatSync(entry);
+    } catch {
+      continue; // 坏链接/权限问题：跳过单个条目，不中断整棵树
+    }
+    if (info.isSymbolicLink()) continue;
+    const member = `${memberPrefix}${name}`;
+    const logical =
+      logicalArchive === undefined ? entry : `${logicalArchive}!/${member}`;
+    if (info.isDirectory()) {
+      walkSessions(entry, collected, depth + 1, logicalArchive, `${member}/`);
+      continue;
+    }
+    if (!info.isFile()) continue;
+    if (isArchivePath(name)) {
+      collected.archives.push({ physicalPath: entry, logicalPath: logical });
+    } else if (sessionFileVersion(name) !== undefined) {
+      // 分组键也用逻辑目录：物理临时目录名每次都不同，不能进排序。
+      const dirKey =
+        logicalArchive === undefined ? root : `${logicalArchive}!/${memberPrefix}`;
+      const files = collected.dshByDir.get(dirKey) ?? [];
+      files.push({ physicalPath: entry, logicalPath: logical });
+      collected.dshByDir.set(dirKey, files);
+    } else if (extname(name).toLowerCase() === CC_EXTENSION) {
+      collected.ccFiles.push({ physicalPath: entry, logicalPath: logical });
+    }
+  }
+}
+
+/**
+ * 把收集到的文件变成分派组。
+ * DSH 按目录分组取最高 vN（DESIGN §5）：不同目录可能是不同会话，
+ * 不能全局只留一个最高版本。排序键一律用逻辑路径（R4 确定性）。
+ */
+function buildGroups(collected: CollectedSessions): DispatchGroup[] {
+  const groups: DispatchGroup[] = [];
+  const dshFiles: SessionSource[] = [];
+  for (const dir of [...collected.dshByDir.keys()].sort()) {
+    const files = collected.dshByDir.get(dir) as SessionSource[];
+    const byLogical = new Map(files.map((file) => [file.logicalPath, file]));
+    const best = pickHighestVersionSessionFile(files.map((file) => file.logicalPath));
+    dshFiles.push((best !== undefined ? byLogical.get(best) : undefined) ?? files[0]!);
+  }
+  if (dshFiles.length > 0) groups.push({ kind: 'dsh', files: dshFiles });
+  if (collected.ccFiles.length > 0) {
+    const sorted = [...collected.ccFiles].sort((a, b) =>
+      a.logicalPath < b.logicalPath ? -1 : a.logicalPath > b.logicalPath ? 1 : 0,
+    );
+    groups.push({ kind: 'cc', files: sorted });
+  }
+  return groups;
+}
+
+/**
+ * 解包一个归档到临时目录，再按目录规则收集。
+ *
+ * 归档里套归档**不展开**：`extractArchive` 只把 `.jsonl` 写到临时目录
+ * （`core/archive.ts` 的 parseTar 对其余条目只计数），内层归档条目根本不会
+ * 落盘，所以递归展开是死代码（R12 裁决，已核实）。内层归档按「非会话条目」
+ * 跳过并计入 `skippedEntries`，在终端摘要里可对账。
+ *
+ * 解出的临时目录登记到 tempDirs，由 runParse 收尾删除；错误文本与返回的
+ * 逻辑路径都不含临时目录名（R4/R7）。
+ */
+function expandArchive(
+  archive: SessionSource,
+  tempDirs: string[],
+  seenArchives: Set<string>,
+): DispatchResult {
+  // 同一归档（含相对/绝对两种写法）只解一次：重复参数不重复计数、不重复出
+  // `[归档]` 行、不产生 `-2` 文件（t5 D2）。
+  const archiveKey = canonicalPath(archive.physicalPath);
+  if (seenArchives.has(archiveKey)) {
+    return { groups: [], archives: [], errors: [], skippedDuplicates: 1 };
+  }
+  seenArchives.add(archiveKey);
+
+  let tempDir: string;
+  try {
+    tempDir = mkdtempSync(join(tmpdir(), 'asu-archive-'));
+  } catch (error) {
+    return {
+      groups: [],
+      archives: [
+        {
+          logicalPath: archive.logicalPath,
+          extracted: 0,
+          skippedEntries: 0,
+          entries: 0,
+          failed: true,
+        },
+      ],
+      errors: [
+        `无法创建解包临时目录：${errorMessage(error)}（${archive.logicalPath}）`,
+      ],
+    };
+  }
+  tempDirs.push(tempDir);
+
+  let extracted: { files: string[]; skippedEntries: number; entries: number };
+  try {
+    extracted = extractArchive(archive.physicalPath, tempDir, {
+      displayPath: archive.logicalPath,
+    });
+  } catch (error) {
+    // 解包失败也打印 `[归档]` 对账行：带上已读到的部分统计（t5）。
+    const partial: ArchivePartialStats | undefined =
+      error instanceof ArchiveExtractionError ? error.partial : undefined;
+    return {
+      groups: [],
+      archives: [
+        {
+          logicalPath: archive.logicalPath,
+          extracted: partial?.extracted ?? 0,
+          skippedEntries: partial?.skippedEntries ?? 0,
+          entries: partial?.entries ?? 0,
+          failed: true,
+        },
+      ],
+      errors: [
+        error instanceof ArchiveExtractionError
+          ? error.message
+          : errorMessage(error),
+      ],
+    };
+  }
+  const report: ArchiveReport = {
+    logicalPath: archive.logicalPath,
+    extracted: extracted.files.length,
+    skippedEntries: extracted.skippedEntries,
+    entries: extracted.entries,
+  };
+
+  const collected = emptyCollected();
+  try {
+    walkSessions(tempDir, collected, 0, archive.logicalPath);
+  } catch (error) {
+    return {
+      groups: [],
+      archives: [report],
+      errors: [
+        `归档解出后扫描失败（${archive.logicalPath}）：${errorMessage(error)}`,
+      ],
+    };
+  }
+
+  const groups = buildGroups(collected);
+  const errors: string[] = [];
+  if (groups.length === 0) {
+    errors.push(
+      `归档内没有 .jsonl 会话文件（归档只展开 .jsonl，DSH .zstd 会话不在支持范围）：${archive.logicalPath}`,
+    );
+  }
+  return { groups, archives: [report], errors };
+}
+
+/** 目录输入：递归扫描 + 解包目录内归档。 */
+function dispatchDirectory(
+  dir: string,
+  tempDirs: string[],
+  seenArchives: Set<string>,
+): DispatchResult {
+  const collected = emptyCollected();
+  try {
+    walkSessions(dir, collected, 0);
+  } catch (error) {
+    return {
+      groups: [],
+      archives: [],
+      errors: [`目录扫描失败（${dir}）：${errorMessage(error)}`],
+    };
+  }
+  const groups = buildGroups(collected);
+  const archives: ArchiveReport[] = [];
+  const errors: string[] = [];
+  let skippedDuplicates = 0;
+  for (const archive of collected.archives) {
+    const expanded = expandArchive(archive, tempDirs, seenArchives);
+    groups.push(...expanded.groups);
+    archives.push(...expanded.archives);
+    errors.push(...expanded.errors);
+    skippedDuplicates += expanded.skippedDuplicates ?? 0;
+  }
+  if (groups.length === 0 && errors.length === 0 && skippedDuplicates === 0) {
+    errors.push(`目录内没有会话文件（.zstd/.jsonl 或 .tar.zst 等归档）：${dir}`);
+  }
+  return { groups, archives, errors, skippedDuplicates };
 }
 
 /**
  * 把一个调用方给的路径展开成分派组。
- * - 文件：按扩展名分派（.zstd → DSH、.jsonl → CC、其他 → 输入错误）；
- * - 目录：目录内直接子文件里，`session.v*.jsonl.zstd` 归 DSH（§5 只读最高 vN，
- *   由 dsh/parse 的 resolveSessionInput 处理），其余 `*.jsonl` 归 CC（含
- *   `.orphaned-*`/`.superseded-*`，由 cc/parse 整文件计跳过，R7）；都不存在 → 错误。
- * - 路径不存在 → 输入错误（R8 归 2 类）。
+ * - 文件：归档 → 解包后递归收集；`.zstd` → DSH；`.jsonl` → CC；其他 → 输入错误；
+ * - 目录：递归收集（DSH 同一目录只读最高 vN；CC 每文件各自成树；
+ *   归档解包后再收集），一个会话文件都没有 → 错误；
+ * - 路径不存在/不是文件也不是目录 → 输入错误（R8 归 2 类）。
  */
-function dispatchInput(path: string): DispatchResult {
+function dispatchInput(
+  path: string,
+  tempDirs: string[],
+  seenArchives: Set<string>,
+): DispatchResult {
   if (!existsSync(path)) {
-    return { groups: [], error: `路径不存在：${path}` };
+    return { groups: [], archives: [], errors: [`路径不存在：${path}`] };
   }
-  const info = statSync(path);
+  let info;
+  try {
+    info = statSync(path);
+  } catch (error) {
+    return {
+      groups: [],
+      archives: [],
+      errors: [`无法读取路径（${path}）：${errorMessage(error)}`],
+    };
+  }
   if (info.isFile()) {
+    const source = asSessionSource(path);
+    if (isArchivePath(path)) return expandArchive(source, tempDirs, seenArchives);
     const ext = extname(path).toLowerCase();
-    if (ext === DSH_EXTENSION) return { groups: [{ kind: 'dsh', files: [path] }] };
-    if (ext === CC_EXTENSION) return { groups: [{ kind: 'cc', files: [path] }] };
-    return { groups: [], error: `无法分派的文件扩展名（仅 .zstd/.jsonl）：${path}` };
+    if (ext === DSH_EXTENSION) {
+      return { groups: [{ kind: 'dsh', files: [source] }], archives: [], errors: [] };
+    }
+    if (ext === CC_EXTENSION) {
+      return { groups: [{ kind: 'cc', files: [source] }], archives: [], errors: [] };
+    }
+    return {
+      groups: [],
+      archives: [],
+      errors: [`无法分派的文件扩展名（仅 .zstd/.jsonl/.tar.zst 等归档）：${path}`],
+    };
   }
-  if (info.isDirectory()) {
-    const dshFiles: string[] = [];
-    const ccFiles: string[] = [];
-    const names = readdirSync(path).sort(); // 字典序：确定性顺序
-    for (const name of names) {
-      const entry = join(path, name);
-      if (!statSync(entry).isFile()) continue; // 目录参数不递归（§7 纯手动）
-      if (sessionFileVersion(name) !== undefined) {
-        dshFiles.push(entry);
-      } else if (extname(name).toLowerCase() === CC_EXTENSION) {
-        ccFiles.push(entry);
-      }
-    }
-    if (dshFiles.length === 0 && ccFiles.length === 0) {
-      return { groups: [], error: `目录内没有会话文件（.zstd/.jsonl）：${path}` };
-    }
-    // 混合目录：DSH 文件与 CC 文件各自成组。DSH 组先做「只读最高 vN」
-    // （DESIGN §5）：目录里的 session.v*.jsonl.zstd 是同一会话的版本演进，
-    // 交最高版给解析器；CC 组按文件各自成树（.orphaned-*/.superseded-* 由
-    // cc/parse 整文件计跳过，R7）。
-    const groups: DispatchGroup[] = [];
-    if (dshFiles.length > 0) {
-      const best = pickHighestVersionSessionFile(dshFiles);
-      groups.push({ kind: 'dsh', files: best !== undefined ? [best] : dshFiles });
-    }
-    if (ccFiles.length > 0) groups.push({ kind: 'cc', files: ccFiles });
-    return { groups };
-  }
-  return { groups: [], error: `既不是文件也不是目录：${path}` };
+  if (info.isDirectory()) return dispatchDirectory(path, tempDirs, seenArchives);
+  return { groups: [], archives: [], errors: [`既不是文件也不是目录：${path}`] };
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +548,70 @@ function sessionSummaryLine(
 /** 错误信息提取（任意 throw 值 → 单行文本，不带堆栈避免终端噪音）。 */
 function errorMessage(error: unknown): string {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+
+/**
+ * 物理路径规范化键：realpath（Windows 大小写/短名也算同一文件）。realpath 失败
+ * 就按原路径，让解析器按自己的口径报错并产错误树。
+ */
+function canonicalPath(filePath: string): string {
+  try {
+    return realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+/**
+ * 命令行参数全局去重（t5 D2）：同一路径（含相对/绝对写法）只展开一次。
+ * 保留首次出现的写法与顺序，输出因此仍由输入顺序决定（DESIGN §10）。
+ * 去掉的重复参数数一并返回，终端要报出来（t6 F9：去重不该是静默行为）。
+ */
+function uniquePaths(paths: readonly string[]): { paths: string[]; skipped: number } {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const path of paths) {
+    const key = canonicalPath(path);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(path);
+  }
+  return { paths: out, skipped: paths.length - out.length };
+}
+
+/**
+ * 去掉重复文件：同一文件被多个参数/目录扫到，或解包后与直接传入重合时只解析一次。
+ * 去重键用物理路径的 realpath（Windows 大小写/短名也算同一文件）；realpath 失败就按
+ * 原路径。保留首个来源，逻辑路径因此取输入里第一次出现的写法（确定性，R4）。
+ * `seen` 可由调用方跨组共享，做到全局只解析一次（t5 D2）。
+ */
+function uniqueFiles(
+  files: readonly SessionSource[],
+  seen: Set<string> = new Set(),
+): SessionSource[] {
+  const out: SessionSource[] = [];
+  for (const file of files) {
+    const key = canonicalPath(file.physicalPath);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(file);
+  }
+  return out;
+}
+
+/** 归档对账行（§11：解出数、跳过数、条目总数，三者可对账；失败也打印，t5）。 */
+function archiveSummaryLine(report: ArchiveReport): string {
+  if (report.failed === true) {
+    // 失败行同样按「解出 + 跳过 = 已读」对账（t6 F1）：未解出的残缺条目计入跳过。
+    return (
+      `[归档] ${report.logicalPath}：解包失败，已解出 ${report.extracted} 个 .jsonl，` +
+      `跳过 ${report.skippedEntries} 个条目（已读 ${report.entries} 条）`
+    );
+  }
+  return (
+    `[归档] ${report.logicalPath}：解出 ${report.extracted} 个 .jsonl，` +
+    `跳过 ${report.skippedEntries} 个非会话条目（共 ${report.entries} 条）`
+  );
 }
 
 /** 失败树的错误摘要（extras.parse_error 原文；无则用统计兜底）。 */
@@ -391,35 +718,71 @@ export function runParse(paths: readonly string[], outDir: string): ParseRunResu
     lines.push(line);
   };
 
-  for (const path of paths) {
-    const dispatch = dispatchInput(path);
-    if (dispatch.error !== undefined) {
-      inputErrorCount += 1;
-      errorLines.push(`[输入错误] ${dispatch.error}`);
-      continue;
-    }
-    for (const group of dispatch.groups) {
-      if (group.kind === 'dsh') {
-        // parseDshSessions：镜像分组 + (sessionId,seq) 去重 + IO 失败占位错误树（R8 内建）
-        for (const tree of parseDshSessions(group.files)) {
-          emitSession(tree, tree.stats.parseErrors > 0);
-        }
-      } else {
-        for (const file of group.files) {
-          let tree: SessionNode;
-          try {
-            tree = parseCcSession(file);
-          } catch (error) {
-            // R8：读失败产占位错误树（与 dsh/parse 的 buildFileErrorTree 同口径）
-            tree = ccErrorTree(file, error);
+  const tempDirs: string[] = [];
+  // 全局去重（t5 D2）：重复参数/重复归档/同文件多处出现都只处理一次，统计不翻倍。
+  const seenArchives = new Set<string>();
+  const seenFiles = new Set<string>();
+  // 因「已处理过」而跳过的重复输入数（t6 F9：只算不报会让去重不可见）。
+  let skippedDuplicateCount = 0;
+  try {
+    // 入口参数去重也算「重复输入」（t6 F9）：同一路径传两次同样要在摘要里可见。
+  const uniqueInputs = uniquePaths(paths);
+  skippedDuplicateCount += uniqueInputs.skipped;
+  for (const path of uniqueInputs.paths) {
+      let dispatch: DispatchResult;
+      try {
+        dispatch = dispatchInput(path, tempDirs, seenArchives);
+      } catch (error) {
+        // 目录不可读等：记输入错误，不中断整批（R8 隔离口径）。
+        inputErrorCount += 1;
+        errorLines.push(`[输入错误] 展开失败（${path}）：${errorMessage(error)}`);
+        continue;
+      }
+      for (const message of dispatch.errors) {
+        inputErrorCount += 1;
+        errorLines.push(`[输入错误] ${message}`);
+      }
+      skippedDuplicateCount += dispatch.skippedDuplicates ?? 0;
+      // 归档对账（R13）：条目数不再丢弃，终端可核对「解出 + 跳过 = 总数」。源条目
+      // 只数内容条目（不含 PAX/GNU 扩展头），见 core/archive.ts 的 entries 注释。
+      for (const report of dispatch.archives) {
+        lines.push(archiveSummaryLine(report));
+      }
+      for (const group of dispatch.groups) {
+        if (group.kind === 'dsh') {
+          // parseDshSessions：镜像分组 + (sessionId,seq) 去重 + IO 失败占位错误树（R8 内建）
+          for (const tree of parseDshSessions(uniqueFiles(group.files, seenFiles))) {
+            emitSession(tree, tree.stats.parseErrors > 0);
           }
-          emitSession(tree, tree.stats.parseErrors > 0);
+        } else {
+          for (const file of uniqueFiles(group.files, seenFiles)) {
+            let tree: SessionNode;
+            try {
+              tree = parseCcSession(file);
+            } catch (error) {
+              // R8：读失败产占位错误树（与 dsh/parse 的 buildFileErrorTree 同口径）
+              tree = ccErrorTree(file, error);
+            }
+            emitSession(tree, tree.stats.parseErrors > 0);
+          }
         }
+      }
+    }
+  } finally {
+    // 归档解出的临时目录只在本轮有效；清理失败不影响已写出的结果。
+    for (const dir of tempDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        // 忽略：临时目录残留不应让整批失败
       }
     }
   }
 
-  // 汇总行（§7）
+  // 汇总行（§7）；重复输入去重若真的发生了，先打一行让「少解析了一次」可见（t6 F9）。
+  if (skippedDuplicateCount > 0) {
+    lines.push(`重复输入已跳过 ${skippedDuplicateCount} 项`);
+  }
   lines.push(`完成：${sessions.length} 个会话、写入 ${writtenFiles.length} 个文件`);
 
   // 退出码三态（R8）：
@@ -462,16 +825,20 @@ export function runParse(paths: readonly string[], outDir: string): ParseRunResu
   };
 }
 
-/** CC 读失败的占位错误树（与 dsh/parse.buildFileErrorTree 同口径，R8）。 */
-function ccErrorTree(file: string, error: unknown): SessionNode {
+/**
+ * CC 读失败的占位错误树（与 dsh/parse.buildFileErrorTree 同口径，R8）。
+ * 错误树只写逻辑路径：归档成员的 mkdtemp 目录名不得进输出（R4/R7）。
+ */
+function ccErrorTree(source: SessionSource, error: unknown): SessionNode {
   const stats = emptyStats();
   stats.producedSpans = 1; // 错误树仍有会话根 span（统计要挂根）
   stats.parseErrors = 1;
-  const name = basename(file);
+  const logical = source.logicalPath;
+  const name = basename(logical);
   const stem = name.replace(/\.jsonl$/i, '');
   return {
     sourceRefs: [],
-    extras: { parse_error: { path: file, message: errorMessage(error) } },
+    extras: { parse_error: { path: logical, message: errorMessage(error) } },
     tool: 'claude-code',
     sessionId: stem.length > 0 ? stem : name,
     agentLabel: 'main',

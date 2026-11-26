@@ -8,7 +8,7 @@
 
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, afterAll } from 'vitest';
 import { msToUnixNano, type SessionNode } from '../../src/core/model.js';
 import {
   MIN_SUPPORTED_FORMAT_VERSION,
@@ -20,6 +20,7 @@ import {
 import { assertConservation, assertDeterministic, assertFieldCoverage } from '../helpers.js';
 import {
   BASE_MS,
+  cleanupSessionDirs,
   compressFrames,
   event,
   makeSessionDir,
@@ -27,6 +28,9 @@ import {
   writeSessionFile,
   type SyntheticSession,
 } from './synthetic.js';
+
+// t6 F7：本文件会建几十个临时会话目录，跑完统一清理，避免 %TEMP% 堆积。
+afterAll(cleanupSessionDirs);
 
 /** 取第一个元素并断言非空（测试里比 `!` 更早给出定位信息）。 */
 function first<T>(items: readonly T[], what = '元素'): T {

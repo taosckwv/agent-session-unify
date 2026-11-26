@@ -7,17 +7,27 @@
 
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { zstdCompressSync } from 'node:zlib';
+import { afterAll, describe, expect, it } from 'vitest';
 import {
   DEFAULT_MAX_FRAME_END_CANDIDATES,
   DEFAULT_MAX_FRAME_OUTPUT_BYTES,
+  decodeZstdFrameBytes,
   decodeZstdFrames,
   findFrameStarts,
   readZstdJsonl,
   ZSTD_FRAME_MAGIC_BYTES,
   ZSTD_FRAME_MAGIC_HEX,
 } from '../../src/dsh/frames.js';
-import { compressFrames, makeSessionDir, writeFramesFile } from './synthetic.js';
+import {
+  cleanupSessionDirs,
+  compressFrames,
+  makeSessionDir,
+  writeFramesFile,
+} from './synthetic.js';
+
+// t6 F7：清理本文件建的临时目录（makeSessionDir 会记录）。
+afterAll(cleanupSessionDirs);
 
 /** 假帧头：只有魔数 + 若干无意义字节（解压必然失败）。 */
 function bogusFrame(payload: readonly number[] = [0x00, 0x01, 0x02, 0x03]): Buffer {
@@ -104,6 +114,15 @@ describe('decodeZstdFrames 正常路径', () => {
       stats: { frames: 0, failedFrames: 0 },
     });
   });
+
+  it('decodeZstdFrameBytes 返回逐帧原始字节（tar 解包复用，不做 UTF-8 解码）', () => {
+    const result = decodeZstdFrameBytes(compressFrames(['abc', 'def']));
+    expect(result.stats).toEqual({ frames: 2, failedFrames: 0 });
+    expect(result.chunks.map((chunk) => Buffer.from(chunk).toString('utf8'))).toEqual([
+      'abc',
+      'def',
+    ]);
+  });
 });
 
 describe('decodeZstdFrames 容错（坏帧跳过并计数，绝不抛）', () => {
@@ -162,6 +181,111 @@ describe('decodeZstdFrames 容错（坏帧跳过并计数，绝不抛）', () =>
     // 第一帧成功；两个假帧各自只试一个右界，都失败。
     expect(result.stats.frames).toBe(1);
     expect(result.stats.failedFrames).toBe(2);
+  });
+});
+
+describe('帧尾探测：假魔数多于候选上限时仍取到精确帧尾（t3 D1）', () => {
+  /** 压缩数据里恰好出现魔数是常态：这里用 N 个假帧把候选预算彻底耗尽。 */
+  function falseMagics(count: number): Buffer {
+    return concatBytes(...Array.from({ length: count }, (_, i) => bogusFrame([0x10 + i, 0x20 + i])));
+  }
+
+  /** 确定性伪随机字节（LCG）：保证测试离线可复现，且熵足够高。 */
+  function pseudoRandomBytes(length: number, seed: number): Buffer {
+    const bytes = Buffer.alloc(length);
+    let state = seed >>> 0;
+    for (let i = 0; i < length; i += 1) {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      bytes[i] = (state >>> 24) & 0xff;
+    }
+    return bytes;
+  }
+
+  /**
+   * 造一个**单个合法 zstd 帧**，其压缩后的字节里夹着 count 个魔数——这正是真实
+   * 样本 `.tar.zst` 的形态（tar 里预压缩的 DSH `.zstd` 成员的字面量被 zstd 原样
+   * 存放）。旧实现只试 4 个候选右界，真帧尾永远轮不到 → 整帧被判坏。
+   */
+  function frameHidingMagics(count: number): { frame: Buffer; payload: Buffer } {
+    const parts: Buffer[] = [];
+    for (let i = 0; i < count; i += 1) {
+      parts.push(pseudoRandomBytes(400, 1000 + i));
+      parts.push(Buffer.from(ZSTD_FRAME_MAGIC_BYTES));
+    }
+    const payload = Buffer.concat(parts);
+    return { frame: zstdCompressSync(payload), payload };
+  }
+
+  it('单帧内夹 7 个假魔数（starts=8 > 候选上限 4）：整帧解出、零坏帧', () => {
+    const { frame, payload } = frameHidingMagics(7);
+    const starts = findFrameStarts(frame);
+    expect(starts.length).toBe(8);
+    expect(starts.length).toBeGreaterThan(DEFAULT_MAX_FRAME_END_CANDIDATES);
+    expect(starts[0]).toBe(0);
+
+    const result = decodeZstdFrameBytes(frame);
+    expect(result.stats).toEqual({ frames: 1, failedFrames: 0 });
+    expect(Buffer.from(result.chunks[0]).equals(payload)).toBe(true);
+  });
+
+  it('快路径候选全被假魔数占满：真帧尾仍精确，后续真实帧不被吞掉', () => {
+    const good1 = compressFrames(['{"a":1}\n']);
+    const good2 = compressFrames(['{"b":2}\n']);
+    const good3 = compressFrames(['{"c":3}\n']);
+    const bytes = concatBytes(good1, falseMagics(6), good2, good3);
+
+    // 起点数 = 3 个真实帧 + 6 个假魔数，远大于默认候选上限（4）。
+    const starts = findFrameStarts(bytes);
+    expect(starts.length).toBe(9);
+    expect(starts.length).toBeGreaterThan(DEFAULT_MAX_FRAME_END_CANDIDATES);
+
+    const result = decodeZstdFrames(bytes);
+    // 三帧都解出；6 个夹在帧间的假帧按契约各计一次 failedFrames。
+    // 若用 bytes.length 当兜底成功右界，后两帧会被第一帧吞掉（frames=1），本断言即失败。
+    expect(result.text).toBe('{"a":1}\n{"b":2}\n{"c":3}\n');
+    expect(result.stats).toEqual({ frames: 3, failedFrames: 6 });
+    expect(result.text).not.toContain('\uFFFD');
+  });
+
+  it('最后一帧的帧尾就是文件末尾：必须能试到 bytes.length', () => {
+    const good1 = compressFrames(['第一帧\n']);
+    const good2 = compressFrames(['第二帧\n']);
+    // 假魔数全部夹在两帧之间：第二个真实帧的起点超出任何固定候选预算。
+    const bytes = concatBytes(good1, falseMagics(6), good2);
+    expect(findFrameStarts(bytes).length).toBe(8);
+
+    const result = decodeZstdFrameBytes(bytes);
+    expect(result.stats).toEqual({ frames: 2, failedFrames: 6 });
+    expect(result.chunks.map((chunk) => Buffer.from(chunk).toString('utf8'))).toEqual([
+      '第一帧\n',
+      '第二帧\n',
+    ]);
+
+    // 输出上限仍然逐帧生效（不能因为换了帧尾算法而丢掉 R9 保护）。
+    const capped = decodeZstdFrameBytes(bytes, { maxFrameOutputBytes: 4 });
+    expect(capped.stats.frames).toBe(0);
+    expect(capped.stats.failedFrames).toBe(8);
+  });
+
+  it('maxFrameEndCandidates=0（关闭快路径）仍精确，不误用 bytes.length 吞帧', () => {
+    const good1 = compressFrames(['one\n']);
+    const good2 = compressFrames(['two\n']);
+    const bytes = concatBytes(good1, falseMagics(5), good2);
+
+    const result = decodeZstdFrames(bytes, { maxFrameEndCandidates: 0 });
+    expect(result.text).toBe('one\ntwo\n');
+    expect(result.stats).toEqual({ frames: 2, failedFrames: 5 });
+  });
+
+  it('假魔数之后紧跟撕裂帧：好的帧解出、撕裂帧计失败，不崩', () => {
+    const good = compressFrames(['ok\n']);
+    const torn = compressFrames(['lost\n']).subarray(0, 10);
+    const bytes = concatBytes(good, falseMagics(5), torn);
+
+    const result = decodeZstdFrames(bytes);
+    expect(result.text).toBe('ok\n');
+    expect(result.stats.frames).toBe(1);
+    expect(result.stats.failedFrames).toBe(6);
   });
 });
 

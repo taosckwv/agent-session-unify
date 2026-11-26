@@ -33,10 +33,12 @@ import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { sha256Hex } from '../core/ids.js';
 import {
+  asSessionSource,
   emptyStats,
   isoToUnixNano,
   msToUnixNano,
   type SessionNode,
+  type SessionSource,
   type SourceRef,
   type Stats,
   type StepNode,
@@ -154,20 +156,26 @@ export function isCcSkippedSessionFile(filePath: string): boolean {
 /**
  * 读一个 CC 会话文件并解析成会话树（t1 §2 契约入口）。
  *
+ * 来源契约（t1 裁决 R4）：`physicalPath` 只用于读盘；`logicalPath` 进一切输出
+ * （sessionId 回退、`extras.sessionFile`、agentLabel 的 hash 种子）。归档成员
+ * 的逻辑路径形如 `<归档参数>!/<成员相对路径>`，临时目录名绝不进结果。
+ * 字符串入参等价于 phys == logical（既有调用方零改动）。
+ *
  * 重写副本不解析内容：仍读文件统计行数（R7 输入口径 = 文件行数），产一棵
  * 只带统计的空树，`skippedRecords` 等于行数。读取失败直接抛给调用方（index.ts
  * 负责按文件计数 parseErrors，R8）。
  */
-export function parseCcSession(filePath: string): SessionNode {
-  const text = readFileSync(filePath, 'utf8');
-  if (isCcSkippedSessionFile(filePath)) {
-    return buildSkippedTree(text, filePath);
+export function parseCcSession(source: string | SessionSource): SessionNode {
+  const resolved = asSessionSource(source);
+  const text = readFileSync(resolved.physicalPath, 'utf8');
+  if (isCcSkippedSessionFile(resolved.logicalPath)) {
+    return buildSkippedTree(text, resolved.logicalPath);
   }
-  return parseCcJsonl(text, filePath);
+  return parseCcJsonl(text, resolved.logicalPath);
 }
 
 /** 仅统计的空树：重写副本、或将来整文件无法解析时的落点（不猜内容）。 */
-function buildSkippedTree(text: string, filePath: string): SessionNode {
+function buildSkippedTree(text: string, logicalPath: string): SessionNode {
   const stats = emptyStats();
   const inputRecords = countRecords(text);
   stats.inputRecords = inputRecords;
@@ -175,7 +183,7 @@ function buildSkippedTree(text: string, filePath: string): SessionNode {
   stats.producedSpans = 1; // 会话根 span 仍在（统计要挂根）
   return {
     tool: 'claude-code',
-    sessionId: sessionIdFromFileName(filePath),
+    sessionId: sessionIdFromFileName(logicalPath),
     agentLabel: 'main',
     sourceRefs: [],
     extras: { skippedRewriteFile: true },
@@ -184,7 +192,10 @@ function buildSkippedTree(text: string, filePath: string): SessionNode {
   };
 }
 
-/** 纯解析入口：jsonl 文本 + 来源路径 → 会话树（无文件 IO，便于合成记录测试）。 */
+/**
+ * 纯解析入口：jsonl 文本 + 来源路径 → 会话树（无文件 IO，便于合成记录测试）。
+ * 第二参是**逻辑**来源路径（写入输出，见 `parseCcSession`）。
+ */
 export function parseCcJsonl(text: string, filePath: string): SessionNode {
   const normalized = text.replace(/^\uFEFF/, '');
   const lines = splitRecords(normalized);
@@ -768,7 +779,8 @@ export function parseCcJsonl(text: string, filePath: string): SessionNode {
   if (recordUserType !== undefined) session.extras['userType'] = recordUserType;
   if (recordEntrypoint !== undefined) session.extras['entrypoint'] = recordEntrypoint;
   if (recordSlug !== undefined) session.extras['slug'] = recordSlug;
-  // 文件路径是 sidechain 唯一化与排障的凭据，始终保留（t9 要求）。
+  // 来源路径是 sidechain 唯一化与排障的凭据，始终保留（t9 要求）；只写逻辑
+  // 路径，归档成员的临时目录名不得进输出（R4/R6）。
   session.extras['sessionFile'] = filePath;
   if (versions.length > 0) session.extras['versions'] = versions;
   if (sessionIds.length > 1) session.extras['sessionIds'] = sessionIds;
@@ -781,6 +793,8 @@ export function parseCcJsonl(text: string, filePath: string): SessionNode {
       session.extras['agentLabelSource'] = 'agentId';
     } else {
       const fileStem = sessionIdFromFileName(filePath);
+      // hash 种子也用逻辑路径：物理路径带 mkdtemp 目录名，会让同一归档两次
+      // 运行产出不同 agentLabel（进而改变 span id 与文件名，R4）。
       session.agentLabel = buildSidechainLabel(fileStem, filePath);
       session.extras['agentLabelSource'] = 'fileStem';
     }
