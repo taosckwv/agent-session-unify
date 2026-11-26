@@ -1,0 +1,418 @@
+#!/usr/bin/env node
+/**
+ * 一键安装：把编译好的 dist/ 装到固定目录，并在命令目录里生成 asu 命令。
+ *
+ * 用法：
+ *   node scripts/install.mjs                     # 安装 / 覆盖安装
+ *   node scripts/install.mjs --rebuild           # 先重新构建再安装
+ *   node scripts/install.mjs --uninstall         # 卸载（只删本脚本装的东西）
+ *   node scripts/install.mjs --prefix <目录> --bin-dir <目录>
+ *
+ * 也可以用环境变量 ASU_PREFIX / ASU_BIN_DIR 指定目录。
+ * 默认：Linux 装到 ~/.local/share/agent-session-unify，命令放到 ~/.local/bin；
+ *       Windows 装到 %LOCALAPPDATA%\agent-session-unify，命令放到 ~/.local/bin。
+ *
+ * 重复执行是安全的：先复制到临时目录、自检通过后再替换旧版本；
+ * 同一个安装目录加了锁，两个进程同时安装会有一个直接退出，不会互相踩。
+ */
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const COMMAND = 'asu';
+const LAUNCHER_MARK = 'agent-session-unify 启动器';
+// .cmd 里不用中文：cmd.exe 按系统代码页读文件，中文注释会显示成乱码。
+const CMD_MARK = 'agent-session-unify launcher';
+
+function log(message) {
+  process.stdout.write(`${message}\n`);
+}
+
+function fail(message) {
+  process.stderr.write(`错误：${message}\n`);
+  process.exit(1);
+}
+
+function defaults() {
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    return {
+      prefix: path.join(localAppData, 'agent-session-unify'),
+      binDir: path.join(os.homedir(), '.local', 'bin'),
+    };
+  }
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  return {
+    prefix: path.join(dataHome, 'agent-session-unify'),
+    binDir: path.join(os.homedir(), '.local', 'bin'),
+  };
+}
+
+function help() {
+  log(`用法：node scripts/install.mjs [选项]
+
+  --prefix <目录>    安装目录（默认 ${defaults().prefix}）
+  --bin-dir <目录>   命令目录（默认 ${defaults().binDir}）
+  --rebuild          强制重新构建后再安装
+  --uninstall        卸载（用同样的 --prefix / --bin-dir）
+  -h, --help         显示本帮助
+
+环境变量 ASU_PREFIX / ASU_BIN_DIR 也可以指定目录。`);
+}
+
+function checkNode() {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major < 23 || (major === 23 && minor < 8)) {
+    fail(`Node 版本太低（当前 ${process.version}）。需要 23.8 或更高，建议 24 LTS。`);
+  }
+  // zstd 解压是解析 DSH 会话的前提，缺了会在运行中途才报错，先在这里挡住。
+  const result = spawnSync(
+    process.execPath,
+    ['-e', 'const z=require("node:zlib");if(typeof z.zstdDecompressSync!=="function")process.exit(1)'],
+    { stdio: 'ignore' },
+  );
+  if (result.status !== 0) fail(`当前 Node（${process.version}）没有 zstd 解压能力，请换 Node 24。`);
+}
+
+function runNpm(args) {
+  // Windows 上不能直接 spawn npm.cmd（Node 会抛 EINVAL），交给 cmd.exe 执行；
+  // 这里只用固定的子命令（ci/install/run build），没有用户输入拼进命令。
+  const isWindows = process.platform === 'win32';
+  const command = isWindows ? process.env.ComSpec || 'cmd.exe' : 'npm';
+  const commandArgs = isWindows
+    ? ['/d', '/s', '/c', `npm ${args.join(' ')}`]
+    : args;
+  const result = spawnSync(command, commandArgs, { cwd: ROOT, stdio: 'inherit' });
+  if (result.error) fail(`无法运行 npm：${result.error.message}`);
+  if (result.status !== 0) fail(`npm ${args.join(' ')} 失败（退出码 ${result.status}）。`);
+}
+
+function newestSourceMtime() {
+  const srcDir = path.join(ROOT, 'src');
+  let newest = 0;
+  try {
+    for (const relative of fs.readdirSync(srcDir, { recursive: true })) {
+      const stat = fs.statSync(path.join(srcDir, relative));
+      if (stat.isFile() && stat.mtimeMs > newest) newest = stat.mtimeMs;
+    }
+  } catch {
+    return 0;
+  }
+  return newest;
+}
+
+function buildIfNeeded(rebuild) {
+  const distIndex = path.join(ROOT, 'dist', 'index.js');
+  if (!fs.existsSync(distIndex) || rebuild) {
+    log(rebuild ? '按 --rebuild 重新构建……' : '没有找到 dist/，先安装依赖并构建……');
+    if (!fs.existsSync(path.join(ROOT, 'node_modules'))) {
+      const hasLock = fs.existsSync(path.join(ROOT, 'package-lock.json'));
+      runNpm([hasLock ? 'ci' : 'install', '--no-audit', '--no-fund']);
+    }
+    runNpm(['run', 'build']);
+  }
+  if (!fs.existsSync(distIndex)) fail('构建后仍找不到 dist/index.js。');
+  if (!rebuild) {
+    const distMtime = fs.statSync(distIndex).mtimeMs;
+    if (newestSourceMtime() > distMtime) {
+      log('提醒：src/ 比 dist/ 新，这次装的是旧构建；要重新构建请加 --rebuild。');
+    }
+  }
+  return path.join(ROOT, 'dist');
+}
+
+function installedPackageJson() {
+  let version = '0.0.0';
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    if (typeof parsed.version === 'string') version = parsed.version;
+  } catch {
+    // 版本号只是随包信息，读不到不影响使用。
+  }
+  return `${JSON.stringify(
+    { name: 'agent-session-unify', version, private: true, type: 'module' },
+    null,
+    2,
+  )}\n`;
+}
+
+function shQuote(value) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function posixLauncher(prefix) {
+  return `#!/bin/sh
+# ${LAUNCHER_MARK}（由 scripts/install.mjs 生成，重新安装会覆盖）
+exec node ${shQuote(path.join(prefix, 'dist', 'index.js'))} "$@"
+`;
+}
+
+function cmdLauncher(prefix) {
+  return `@echo off\r
+rem ${CMD_MARK} (generated by scripts/install.mjs; reinstalling overwrites)\r
+node "${path.join(prefix, 'dist', 'index.js')}" %*\r
+`;
+}
+
+function isSymlink(target) {
+  try {
+    return fs.lstatSync(target).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/** 已有同名命令时，只允许动本脚本生成的文件，避免覆盖别人的 asu。 */
+function assertOwnCommand(file, marker, expectedLinkTarget) {
+  if (isSymlink(file)) {
+    const target = path.resolve(path.dirname(file), fs.readlinkSync(file));
+    if (target !== path.resolve(expectedLinkTarget)) {
+      fail(`${file} 已指向 ${target}，为避免覆盖，先手动处理或换 --bin-dir。`);
+    }
+    return;
+  }
+  if (fs.existsSync(file) && !readText(file).includes(marker)) {
+    fail(`${file} 已存在且不是本工具安装的，为避免覆盖，先手动移走或换 --bin-dir。`);
+  }
+}
+
+let releaseLock = null;
+
+/** 同一个安装目录只允许一个安装/卸载进程，避免并发时互相删文件。 */
+function acquireLock(prefix) {
+  const digest = crypto.createHash('sha1').update(prefix).digest('hex').slice(0, 16);
+  const lockFile = path.join(os.tmpdir(), `agent-session-unify-${digest}.lock`);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx');
+      fs.writeSync(fd, `${process.pid}\n`);
+      fs.closeSync(fd);
+      releaseLock = () => {
+        try {
+          fs.rmSync(lockFile, { force: true });
+        } catch {
+          // 锁删不掉不影响下次判断：进程号已不存在时会自动当作过期锁。
+        }
+        releaseLock = null;
+      };
+      return;
+    } catch (error) {
+      if (error.code !== 'EEXIST') fail(`无法创建安装锁 ${lockFile}：${error.message}`);
+      let owner = 0;
+      let age = 0;
+      try {
+        owner = Number.parseInt(readText(lockFile).trim(), 10);
+        age = Date.now() - fs.statSync(lockFile).mtimeMs;
+      } catch {
+        continue; // 另一个进程刚好删了锁，重试一次。
+      }
+      const alive = Number.isInteger(owner) && owner > 0 && (() => {
+        try {
+          process.kill(owner, 0);
+          return true;
+        } catch (killError) {
+          return killError.code === 'EPERM';
+        }
+      })();
+      // 进程已经不在，或者锁放了超过 10 分钟，当作上次异常退出留下的过期锁。
+      if (!alive || age > 10 * 60 * 1000) {
+        fs.rmSync(lockFile, { force: true });
+        continue;
+      }
+      fail(`另一个安装/卸载进程正在运行（pid ${owner}）。等它结束后再试。`);
+    }
+  }
+  fail('两次尝试后仍无法取得安装锁，请稍后再试。');
+}
+
+process.once('exit', () => {
+  if (releaseLock) releaseLock();
+});
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  try {
+    process.once(signal, () => {
+      if (releaseLock) releaseLock();
+      process.exit(130);
+    });
+  } catch {
+    // Windows 上不一定能监听这个信号，忽略即可。
+  }
+}
+
+/** 清掉上次安装中断留下的临时目录；正常结束时不会留下。 */
+function cleanupStaleDirs(prefix) {
+  let entries;
+  try {
+    entries = fs.readdirSync(prefix);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (name.startsWith('.dist-staging-') || name.startsWith('.dist-old-')) {
+      fs.rmSync(path.join(prefix, name), { recursive: true, force: true });
+    }
+  }
+}
+
+/** 不带参数运行入口，应当打印用法并以 2 退出，否则说明这份产物坏了。 */
+function verifyDist(distDir) {
+  const result = spawnSync(process.execPath, [path.join(distDir, 'index.js')], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 2 || !/用法/.test(result.stderr || '')) {
+    fail(`安装后自检失败（退出码 ${result.status}）：${(result.stderr || '').trim()}`);
+  }
+}
+
+function install(prefix, binDir, rebuild) {
+  acquireLock(prefix);
+  checkNode();
+  const dist = buildIfNeeded(rebuild);
+
+  fs.mkdirSync(prefix, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  cleanupStaleDirs(prefix);
+
+  // 先装到临时目录并自检，通过后再替换旧的 dist；中途失败不影响正在用的旧版本。
+  const staging = path.join(prefix, `.dist-staging-${process.pid}`);
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.cpSync(dist, staging, { recursive: true });
+  fs.writeFileSync(path.join(prefix, 'package.json'), installedPackageJson());
+  verifyDist(staging);
+
+  const target = path.join(prefix, 'dist');
+  const backup = path.join(prefix, `.dist-old-${process.pid}`);
+  fs.rmSync(backup, { recursive: true, force: true });
+  if (fs.existsSync(target)) fs.renameSync(target, backup);
+  fs.renameSync(staging, target);
+  fs.rmSync(backup, { recursive: true, force: true });
+
+  if (process.platform === 'win32') {
+    const cmdPath = path.join(binDir, `${COMMAND}.cmd`);
+    assertOwnCommand(cmdPath, CMD_MARK, cmdPath);
+    fs.writeFileSync(cmdPath, cmdLauncher(prefix));
+    log(`已生成命令：${cmdPath}`);
+  } else {
+    const launcherPath = path.join(binDir, COMMAND);
+    assertOwnCommand(launcherPath, LAUNCHER_MARK, launcherPath);
+    // 先写临时文件再改名，避免正好在执行命令时被读到写了一半的内容。
+    const launcherTemp = `${launcherPath}.tmp-${process.pid}`;
+    fs.writeFileSync(launcherTemp, posixLauncher(prefix), { mode: 0o755 });
+    fs.chmodSync(launcherTemp, 0o755);
+    fs.renameSync(launcherTemp, launcherPath);
+    log(`已生成命令：${launcherPath}`);
+  }
+
+  verifyDist(target);
+
+  log(`安装目录：${prefix}`);
+  log('自检通过：dist/index.js 可以运行（无参数时退出码 2 属预期）。');
+
+  const pathEntries = (process.env.PATH || '')
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((entry) => path.resolve(entry.replace(/^"|"$/g, '')));
+  if (pathEntries.includes(path.resolve(binDir))) {
+    log(`命令已可用：${COMMAND}`);
+  } else {
+    log(`提醒：${binDir} 不在 PATH 里，需要加一行才能直接输入 ${COMMAND}。`);
+    if (process.platform === 'win32') {
+      log(`  在“系统属性 -> 环境变量”里把 ${binDir} 加进用户 PATH，重开终端即可。`);
+    } else {
+      log(`  把下面一行加到 ~/.bashrc 或 ~/.zshrc，然后重开终端：`);
+      log(`  export PATH="${binDir}:$PATH"`);
+    }
+  }
+  log(`用法：${COMMAND} parse <会话文件或目录> [--out <输出目录>]`);
+  log(`卸载：node scripts/install.mjs --uninstall --prefix "${prefix}" --bin-dir "${binDir}"`);
+}
+
+function uninstall(prefix, binDir) {
+  acquireLock(prefix);
+  const linkPath = path.join(binDir, COMMAND);
+  if (isSymlink(linkPath)) {
+    // 兼容早期用符号链接安装的情况：只删指向这个安装目录的链接。
+    const target = path.resolve(path.dirname(linkPath), fs.readlinkSync(linkPath));
+    const ownTargets = [path.join(prefix, COMMAND), path.join(prefix, 'dist', 'index.js')];
+    if (ownTargets.includes(target)) {
+      fs.unlinkSync(linkPath);
+      log(`已删除命令：${linkPath}`);
+    } else {
+      log(`跳过 ${linkPath}：它指向别处（${target}）。`);
+    }
+  } else if (fs.existsSync(linkPath) && readText(linkPath).includes(LAUNCHER_MARK)) {
+    fs.rmSync(linkPath, { force: true });
+    log(`已删除命令：${linkPath}`);
+  }
+
+  const cmdPath = path.join(binDir, `${COMMAND}.cmd`);
+  if (fs.existsSync(cmdPath) && readText(cmdPath).includes(CMD_MARK)) {
+    fs.rmSync(cmdPath, { force: true });
+    log(`已删除命令：${cmdPath}`);
+  }
+
+  if (fs.existsSync(prefix)) {
+    fs.rmSync(prefix, { recursive: true, force: true });
+    log(`已删除安装目录：${prefix}`);
+  } else {
+    log(`安装目录不存在，跳过：${prefix}`);
+  }
+  log('卸载完成。');
+}
+
+const defaultsPaths = defaults();
+let prefix = process.env.ASU_PREFIX
+  ? path.resolve(process.env.ASU_PREFIX)
+  : defaultsPaths.prefix;
+let binDir = process.env.ASU_BIN_DIR
+  ? path.resolve(process.env.ASU_BIN_DIR)
+  : defaultsPaths.binDir;
+let mode = 'install';
+let rebuild = false;
+
+const args = process.argv.slice(2);
+for (let index = 0; index < args.length; index += 1) {
+  const arg = args[index];
+  if (arg === '--uninstall') {
+    mode = 'uninstall';
+  } else if (arg === '--rebuild') {
+    rebuild = true;
+  } else if (arg === '--help' || arg === '-h') {
+    help();
+    process.exit(0);
+  } else if (arg === '--prefix') {
+    const value = args[index + 1];
+    if (!value) fail('--prefix 后面需要目录。');
+    prefix = path.resolve(value);
+    index += 1;
+  } else if (arg.startsWith('--prefix=')) {
+    prefix = path.resolve(arg.slice('--prefix='.length));
+  } else if (arg === '--bin-dir') {
+    const value = args[index + 1];
+    if (!value) fail('--bin-dir 后面需要目录。');
+    binDir = path.resolve(value);
+    index += 1;
+  } else if (arg.startsWith('--bin-dir=')) {
+    binDir = path.resolve(arg.slice('--bin-dir='.length));
+  } else {
+    fail(`未知参数：${arg}（用 --help 看用法）`);
+  }
+}
+
+if (mode === 'uninstall') {
+  uninstall(prefix, binDir);
+} else {
+  install(prefix, binDir, rebuild);
+}
