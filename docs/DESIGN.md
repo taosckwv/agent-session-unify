@@ -13,7 +13,7 @@
 | DSH | 只适配 v4 及以上；v3 及以下的旧帧跳过并计数，不猜 |
 | Claude Code | 只适配 2.1.3xx（本机会话当开发样本）；2.1.88 等真实样本到手后补分支 |
 | Codex | 不做 |
-| 输入形态 | 三类：会话文件（`.zstd` 按 DSH 解析、`.jsonl` 按 CC 解析）、目录（递归展开）、归档（先解包再按 `.jsonl` 解析） |
+| 输入形态 | 三类：会话文件（`.zstd` 按 DSH 解析、`.jsonl` 按 CC 解析）、目录（递归展开；DSH 的版本化布局 `session.vN.jsonl.zstd` 与扁平布局 `session-<uuid>.jsonl.zstd` / `<uuid>.jsonl.zstd` 都认）、归档（先解包再按 `.jsonl` 解析） |
 | 支持的归档 | `.tar.zst` / `.tar.zstd` / `.tar.gz` / `.tgz` / `.tar`；解到系统临时目录，解析完就删。`.zip` 不做 |
 | 归档里的内容 | 只提取 `.jsonl`。DSH 的 `session.vN.jsonl.zstd` 打进归档不会被解析，按「非会话条目」跳过并计数；要看 DSH 请直接传 `.zstd` 文件或它的目录 |
 | 嵌套归档 | 不展开：归档里的归档同样按非会话条目计数，不递归解 |
@@ -133,7 +133,7 @@ src/
     ids.ts          span/trace id 派生 + 占位符 hash（同一套确定性算法）
     redact.ts       脱敏规则与占位符
     otlp.ts         OTLP 类型 + 键序固定的序列化 + 落盘
-    zstd.ts         多帧 zstd 字节解码：按帧魔数定帧尾、逐帧解、单帧与累计双上限
+    zstd.ts         多帧 zstd 字节解码：按帧结构（RFC 8878 帧头 + 块头）定帧尾、逐帧解、单帧与累计双上限
     archive.ts      tar 解析与安全解包：会话归档 → 临时目录，只落 .jsonl
   dsh/
     frames.ts       读 .zstd 文件，并把 core/zstd 的解码符号原样再导出（壳）
@@ -154,12 +154,12 @@ data/               真实样本副本（已 gitignore）
 | 模块 | 吃进 | 吐出 | 藏在里面的复杂度 |
 |---|---|---|---|
 | dsh/frames.ts | `.zstd` 文件路径 | 解压后的 jsonl 文本 | 只剩读文件；解码符号全部再导出 `core/zstd.ts`，不抄第二份 |
-| core/zstd.ts | zstd 字节 | 逐帧解出的字节 + 帧级统计 | 帧与行不是 1:1，必须全解完拼成整段文本再切行；压缩数据里会出现假魔数，帧尾要按「能解开的最小右界」定位；坏帧/撕裂尾帧跳过并计数；单帧与累计输出双上限防 OOM |
+| core/zstd.ts | zstd 字节 | 逐帧解出的字节 + 帧级统计 | 帧与行不是 1:1，必须全解完拼成整段文本再切行；帧尾按 RFC 8878 帧头+块头精确算出（压缩数据里的假魔数骗不到它），结构解析不出来才回退「能解开的最小右界」；结构说字节不够就计坏帧、不回退试解（解码器对截断的宽容度随 Node 版本变，会静默返回半帧）；坏帧/撕裂尾帧跳过并计数；单帧与累计输出双上限防 OOM |
 | core/archive.ts | 归档路径 + 落盘目录 + 展示路径 | 解出的 `.jsonl` 路径 + 条目统计 | tar 只覆盖会话归档会用到的形态（ustar、ustar prefix、PAX `path`、GNU 长名）；只写 `.jsonl`；拒绝绝对路径/盘符/`..`/Windows 非法字符/保留名；不创建链接；校验头校验和、严格要结束块；报错文本用调用方给的展示路径（逻辑路径），不泄漏临时目录 |
-| dsh/parse.ts | jsonl 文本 + 文件元信息 | 会话树 + 统计 | 只读最高 vN；v3 及以下帧跳过并计数；镜像重复按 `(session_id, seq)` 去重；usage 只取 `assistant/message`；`surfaceOp` 两种写法都认 |
-| cc/parse.ts | `projects/*.jsonl` 路径 | 会话树 + 统计 | 跳过 `.orphaned-*` / `.superseded-*`；按 `message.id` 聚合、usage 只从带 usage 的记录取；用户消息切 turn；`tool_use ↔ tool_result` 配对；compact 按 `logicalParentUuid` 重接；无 version 不猜、继承同文件最近版本 |
+| dsh/parse.ts | jsonl 文本 + 文件元信息 | 会话树 + 统计 | 版本化命名只读最高 vN，扁平命名各算一个会话（两种布局都认）；v3 及以下帧跳过并计数；镜像重复按 `(session_id, seq)` 去重；usage 只取 `assistant/message`；`surfaceOp` 两种写法都认 |
+| cc/parse.ts | `projects/*.jsonl` 路径 | 会话树 + 统计 | 跳过 `.orphaned-*` / `.superseded-*`；取文件名 `/` 与 `\` 都当分隔符（不依赖平台）；按 `message.id` 聚合、usage 只从带 usage 的记录取；用户消息切 turn；`tool_use ↔ tool_result` 配对；compact 按 `logicalParentUuid` 重接；无 version 不猜、继承同文件最近版本 |
 | core/spanBuilder.ts | 一棵会话树 | OTLP 结构 | 四层树；字段三去向；跨文件父子引用；缺起点用下一事件时间回填；统计挂根 span |
-| core/redact.ts | 任意字符串 | 原文或占位符 | 第 8 节的最小规则集；同一原文永远得到同一占位符 |
+| core/redact.ts | 任意字符串 | 原文或占位符 | 第 8 节的规则集（整串前缀、敏感字段值、锚点+形态的自由文本口令、正文里的已知前缀 token）；同一原文永远得到同一占位符 |
 | core/otlp.ts | OTLP 结构 | 文件 | 键序固定；文件名 `<会话id>__<agent标识>.json`；不掺当前时间与随机数 |
 | index.ts | 命令行参数 | 退出码 + 摘要 | parse 命令、路径编排（递归、归档展开、去重、逻辑路径）、临时目录清理、多输入汇总 |
 
@@ -189,7 +189,8 @@ core 里的模块之间可以互相引用，但不能引用 `dsh/`、`cc/`、`in
 
 ## 5. DSH 解析口径
 
-- **容器**：多帧 zstd，按帧魔数逐帧解，只读最高 vN 的 `session.v*.jsonl.zstd`。
+- **容器**：多帧 zstd，按帧魔数逐帧解。帧尾按 RFC 8878 的帧头 + 块头**算出来**，不靠「能不能解开」试解——解码器对截断输入的宽容度随 Node 版本变（Node 25 实测：静默返回部分文本，不抛错）。所以只解 `[帧头, 帧尾)`，帧头声明了大小就核对；结构说「字节不够」一律计坏帧，绝不回退试解（回退会把半帧冒充成整帧）。结构解析不出来（未知变体、帧内假魔数）才回退旧的试解启发式。
+- **文件名两种布局**：版本化 `session.vN.jsonl.zstd`（`~/.dsh/sessions/<ws>/<sessionId>/`，同目录只取最高 `vN`）；扁平命名 `session-<uuid>.jsonl.zstd` / `<uuid>.jsonl.zstd`（导出 dump 布局，一个文件一个会话，不折叠）。版本一律按记录判，不从文件名反推。
 - **usage 只取一处**：`assistant/message` 事件里的 `data.usage`。`assistant/attempt` 不取（取了会重复计账）；compaction 的用量单独一个 span，不混进 step。
 - **usage 字段映射**：input→`gen_ai.usage.input_tokens`，output→`gen_ai.usage.output_tokens`，cacheRead→`gen_ai.token_count.cache_read`（输入侧），reasoning（属于 output 的一部分）→`gen_ai.usage.output_tokens.reasoning_tokens`。非负整数校验，认不出的原样进 `asu.*`。
 - **已知坑照单全收**：`surfaceOp` 的 `start/end` 与 `startSeq/endSeq` 两种写法都认；v3 的 `isError` 藏在 `content[0]` 和 `data.error` 两处都查；`new-api` 与 `newapi` 是两个不同的 provider 名，不归一。
@@ -197,7 +198,7 @@ core 里的模块之间可以互相引用，但不能引用 `dsh/`、`cc/`、`in
 
 ## 6. Claude Code 解析口径
 
-- **入口**：按文件传（`projects/<项目目录>/*.jsonl`）；自动跳过 `.orphaned-*` / `.superseded-*` 重写副本。
+- **入口**：按文件传（`projects/<项目目录>/*.jsonl`）；自动跳过 `.orphaned-*` / `.superseded-*` 重写副本。取文件名时 `/` 与 `\` 都当分隔符，不依赖运行平台的 `path` 实现——逻辑路径可能来自任意平台的归档成员。
 - **聚合**：2.1.3xx 一条 assistant 记录只装一个 content block，多条共享 `message.id`——按 `message.id` 聚合成一个 step span，usage 只从带 usage 字段的那条取，避免 token 和轮次被放大 2–5 倍。
 - **turn 切分**：文件里没有现成的 turn 事件，以用户消息记录为界：一条 user 记录开始一个 turn，直到下一条 user 记录。
 - **无 version 记录**：不猜版本，原样保留进 `asu.*`，版本字段留空。
@@ -213,7 +214,7 @@ parse <文件或目录路径...> [--out <目录>]（默认 data/unified/）
 ```
 
 - 纯手动传路径，不做自动发现、不主动扫盘。路径可以是三类：会话文件（`.zstd` 按 DSH、`.jsonl` 按 CC）、目录、归档。
-- **目录递归展开**：子目录同规则，按字典序；不跟符号链接；DSH 在同一目录只读最高 `vN`，CC 每个文件各自成树。目录里一个会话文件和归档都没有 → 输入错误。
+- **目录递归展开**：子目录同规则，按字典序；不跟符号链接。DSH 目录里：版本化命名（`session.vN.jsonl.zstd`）只取最高 `vN`，扁平命名（`session-<uuid>.jsonl.zstd` / `<uuid>.jsonl.zstd`）各算一个会话，两种混放时各按各的规则；CC 每个文件各自成树。目录里一个会话文件和归档都没有 → 输入错误。
 - **归档**：`.tar.zst` / `.tar.zstd` / `.tar.gz` / `.tgz` / `.tar`。先解到系统临时目录，再只把 `.jsonl` 当 CC 会话文件收进来；解析结束（成功或失败）都删临时目录。归档里的 DSH `.zstd` 不解析，按非会话条目计数；内层归档不展开（第 2 节）。
 - **去重**：同一文件 / 归档 / 目录重复传（包括「目录 + 目录里的文件」「归档 + 目录里的同一归档」）按真实路径（realpath）认作同一份，只解析一次、保留第一次的写法；摘要里报「重复输入已跳过 N 项」。
 - **逻辑路径**（第 10 节）：直接传的会话文件，输出里就是参数原样；传目录时是「目录参数 + 目录内相对路径」拼出来的路径。两种都不 resolve 成绝对路径——相对就相对、绝对就绝对。归档成员是 `<归档参数>!/<归档内相对路径>`（`/` 分隔）。临时目录名不进任何输出。
@@ -224,12 +225,17 @@ parse <文件或目录路径...> [--out <目录>]（默认 data/unified/）
 ## 8. 脱敏
 
 - **时机**：边解析边脱敏，落盘文件里只有占位符，原文不落盘。
-- **V1 规则**（最小集）：
-  1. 凭据前缀：`sk-` / `AKIA` / `ghp_` / `xox` / `JWT` / `Bearer` 开头的字符串；
-  2. 配置里的 `apiKey` / `token` / `password` / `secret` 字段的值。
+- **规则集**（最小集，遇到真实案例再补一条记一条）：
+  1. 凭据前缀：`sk-` / `AKIA` / `ghp_` / `xox` / `JWT` / `Bearer` 开头的**整串**；
+  2. 配置里的 `apiKey` / `token` / `password` / `secret` 字段的值（字段名任意大小写、驼峰/下划线/中划线变体，值为对象/数组时递归）；
+  3. 自由文本口令（2026-11-26 生产案例补：日志里凭据多以对话正文形态出现，既无已知前缀也不在敏感字段名下）：按「锚点 + 形态」双闸判定——
+     - 锚点必须明确：`密码/口令/password/pwd` 关键词赋值（`密码：` / `password =` / `口令是`）、`--password=` 这类参数名、连接串/URL 的 `user:pass@`、`sshpass -p`、裸 `字母@数字`（`@` 之后没有点，邮箱与 `user@host` / `root@10.1.1.1` 因此被排除）；
+     - 形态还要像凭据：含 ASCII 字母且含数字或符号（纯字母词、纯中文不算，否则「密码是错的」这类正文会被误杀）；带引号的值由「锚点 + 引号」定性，纯字母口令同样替换；
+     - 明确不动：模板插值 `${VAR:?…}`、文档占位 `<password>`、npm 临时目录名（`@scope-2+3-3-4@0_32`）这类路径——脱敏不许改坏配置正文与路径；
+  4. 正文里的已知前缀 token：粘在句子里的 `sk-…` / `AKIA…` / `ghp_…` / `xox?-…` / `AIza…` / `Bearer <token>` 按 token 就地替换（`Bearer` 说明词保留）。规则 1 只认整串，规则 4 补正文中段，`tool_use.input` 里的凭据因此也会脱。
 - 命中即替换成带 hash 前缀的占位符（hash 用确定性算法，同一原文得到同一占位符，可对账）。
-- **待办清单**（遇到真实案例再补规则，补一条记一条）：连接串里的账号口令、URL 里的 token、Authorization 头的完整解析。
-- **已知风险**：V1 规则没覆盖的凭据会落进输出文件。输出文件按「原始日志同级」的敏感级别管理，只放本地 `data/`，不入库。
+- **待办清单**（遇到真实案例再补规则，补一条记一条）：Authorization 头的完整解析、kerberos 票据等。
+- **已知风险**：上述规则之外的凭据会落进输出文件（典型是既无锚点、形态也不像凭据的自由文本）。输出文件按「原始日志同级」的敏感级别管理，只放本地 `data/`，不入库。
 
 ## 9. 测试与断言
 
