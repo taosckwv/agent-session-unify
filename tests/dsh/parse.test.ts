@@ -12,6 +12,7 @@ import { describe, expect, it, afterAll } from 'vitest';
 import { msToUnixNano, type SessionNode } from '../../src/core/model.js';
 import {
   MIN_SUPPORTED_FORMAT_VERSION,
+  isDshSessionContainer,
   parseDshSession,
   parseDshSessions,
   pickHighestVersionSessionFile,
@@ -625,6 +626,37 @@ describe('版本判定（DESIGN §2/§5、R5）', () => {
     const dir = makeSessionDir();
     writeFileSync(join(dir, 'notes.txt'), 'x');
     expect(() => parseDshSession(dir)).toThrow(/没有 session/);
+  });
+
+  it('扁平命名容器：isDshSessionContainer 认，sessionFileVersion 不判版', () => {
+    expect(isDshSessionContainer('session.v4.jsonl.zstd')).toBe(true);
+    expect(isDshSessionContainer('session-aaaa-bbbb.jsonl.zstd')).toBe(true);
+    expect(isDshSessionContainer('aaaa-bbbb.jsonl.zstd')).toBe(true);
+    expect(isDshSessionContainer('SESSION.V4.JSONL.ZSTD')).toBe(true);
+    expect(isDshSessionContainer('a.jsonl')).toBe(false);
+    expect(isDshSessionContainer('a.tar.zst')).toBe(false);
+    expect(isDshSessionContainer('garbage.zstd')).toBe(false);
+    // 扁平命名不判版（版本按记录判）：sessionFileVersion 回答 undefined。
+    expect(sessionFileVersion('session-aaaa-bbbb.jsonl.zstd')).toBeUndefined();
+    expect(sessionFileVersion('aaaa-bbbb.jsonl.zstd')).toBeUndefined();
+  });
+
+  it('目录里只有扁平命名：单个直接用，多个则拒绝猜（不静默取第一个）', () => {
+    const single = makeSessionDir();
+    writeSessionFile(single, canonicalSession(), 'aaaa-bbbb.jsonl.zstd');
+    expect(parseDshSession(single).sessionId).toBe('sess-1');
+
+    const multi = makeSessionDir();
+    writeSessionFile(multi, { ...canonicalSession(), id: 'flat-a' }, 'aaaa.jsonl.zstd');
+    writeSessionFile(multi, { ...canonicalSession(), id: 'flat-b' }, 'bbbb.jsonl.zstd');
+    expect(() => parseDshSession(multi)).toThrow(/扁平命名/);
+    // 批量入口一次收多个文件：两个都是独立会话，版本各自从记录里判。
+    const trees = parseDshSessions([
+      join(multi, 'aaaa.jsonl.zstd'),
+      join(multi, 'bbbb.jsonl.zstd'),
+    ]);
+    expect(trees.map((tree) => tree.sessionId)).toEqual(['flat-a', 'flat-b']);
+    expect(trees.map((tree) => tree.formatVersion)).toEqual([4, 4]);
   });
 
   it('sessionFileVersion / pickHighestVersionSessionFile 按版本规则工作', () => {

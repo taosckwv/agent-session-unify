@@ -10,7 +10,14 @@
  * - 确定性（§9-③）：同输入两次 runParse，输出文件字节相同。
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -320,6 +327,35 @@ describe('runParse：DSH .zstd（成功与坏输入）', () => {
     expect(result.sessions.length).toBe(1);
     expect(result.sessions[0]?.steps).toBe(1); // v4 内容
     expect(result.sessions[0]?.skippedV3).toBe(0); // 同目录 v3 未读（只读最高 vN）
+  });
+
+  it('扁平命名目录：session-<uuid> 与 <uuid> 各算一个会话，不折叠', () => {
+    const dir = tempDir();
+    writeSessionFile(dir, { ...makeDshSession(), id: 'sess-a' }, 'session-aaaa-0001.jsonl.zstd');
+    writeSessionFile(dir, { ...makeDshSession(), id: 'sess-b' }, 'bbbb-0002.jsonl.zstd');
+    // 嵌套目录里的扁平文件同样是一个独立会话（递归扫描）。
+    const nested = join(dir, 'deeper');
+    mkdirSync(nested, { recursive: true });
+    writeSessionFile(nested, { ...makeDshSession(), id: 'sess-c' }, 'cccc-0003.jsonl.zstd');
+    const result = runParse([dir], join(tempDir(), 'out'));
+
+    expect(result.exitCode).toBe(EXIT_OK);
+    expect(result.sessions.length).toBe(3);
+    expect(result.sessions.map((s) => s.sessionId).sort()).toEqual(['sess-a', 'sess-b', 'sess-c']);
+    expect(result.writtenFiles.length).toBe(3);
+  });
+
+  it('混放目录：版本化只取最高 vN，扁平命名的照收（不被折叠规则吃掉）', () => {
+    const dir = tempDir();
+    writeSessionFile(dir, { ...makeDshSession(), id: 'sess-v3', version: 3 }, 'session.v3.jsonl.zstd');
+    writeSessionFile(dir, { ...makeDshSession(), id: 'sess-v4' }, 'session.v4.jsonl.zstd');
+    writeSessionFile(dir, { ...makeDshSession(), id: 'sess-flat' }, 'dddd-0004.jsonl.zstd');
+    const result = runParse([dir], join(tempDir(), 'out'));
+
+    expect(result.exitCode).toBe(EXIT_OK);
+    expect(result.sessions.length).toBe(2);
+    expect(result.sessions.map((s) => s.sessionId)).toEqual(['sess-v4', 'sess-flat']);
+    expect(result.sessions[0]?.skippedV3).toBe(0);
   });
 
   it('垃圾 .zstd：全解析失败 → 退出码 1（R8），占位错误树仍写盘', () => {

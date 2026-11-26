@@ -23,7 +23,8 @@
  * 用法（DESIGN §7）：`parse <文件或目录路径...> [--out <目录>]`（默认 data/unified/）。
  * 纯手动传路径：不做自动发现、不主动扫盘；目录参数**递归**展开，会话文件
  * （DSH `.zstd`、CC `.jsonl`）与归档（`.tar.zst`/`.tar.gz`/`.tgz`/`.tar`）都收；
- * 归档先解到临时目录再扫，DSH 按「同一目录只读最高 vN」分组（DESIGN §5）。
+ * 归档先解到临时目录再扫，DSH 按「同一目录只读最高 vN」分组（DESIGN §5），
+ * 扁平命名（`session-<uuid>.jsonl.zstd` / `<uuid>.jsonl.zstd`）的文件各算一个会话。
  */
 
 import {
@@ -49,7 +50,12 @@ import {
   type ArchivePartialStats,
 } from './core/archive.js';
 import { serializeTracesData, writeSessionFile } from './core/otlp.js';
-import { parseDshSessions, pickHighestVersionSessionFile, sessionFileVersion } from './dsh/parse.js';
+import {
+  isDshSessionContainer,
+  parseDshSessions,
+  pickHighestVersionSessionFile,
+  sessionFileVersion,
+} from './dsh/parse.js';
 import { emptyStats, asSessionSource, type SessionNode, type SessionSource } from './core/model.js';
 
 /** CLI 版本（package.json version 的镜像；tests/smoke.test.ts 断言其形状）。 */
@@ -190,7 +196,7 @@ interface DispatchResult {
 
 /** 目录递归扫描的中间结果。 */
 interface CollectedSessions {
-  /** 逻辑目录 → 该目录下的 DSH 会话文件（同一目录只取最高 vN）。 */
+  /** 逻辑目录 → 该目录下的 DSH 会话容器（版本化只取最高 vN；扁平命名各算一个）。 */
   dshByDir: Map<string, SessionSource[]>;
   /** CC 会话文件（每个文件各自成树）。 */
   ccFiles: SessionSource[];
@@ -238,7 +244,9 @@ function walkSessions(
     if (!info.isFile()) continue;
     if (isArchivePath(name)) {
       collected.archives.push({ physicalPath: entry, logicalPath: logical });
-    } else if (sessionFileVersion(name) !== undefined) {
+    } else if (isDshSessionContainer(name)) {
+      // 容器判定只看 `.jsonl.zstd` 后缀：版本化（session.vN）与扁平（<uuid>）都收，
+      // 版本/折叠规则留到 buildGroups 按目录处理。
       // 分组键也用逻辑目录：物理临时目录名每次都不同，不能进排序。
       const dirKey =
         logicalArchive === undefined ? root : `${logicalArchive}!/${memberPrefix}`;
@@ -253,8 +261,15 @@ function walkSessions(
 
 /**
  * 把收集到的文件变成分派组。
- * DSH 按目录分组取最高 vN（DESIGN §5）：不同目录可能是不同会话，
- * 不能全局只留一个最高版本。排序键一律用逻辑路径（R4 确定性）。
+ *
+ * DSH 按目录分组（DESIGN §5），目录内再按命名布局分流：
+ * - 版本化 `session.vN.jsonl.zstd`：同一目录只读最高 vN（不同目录可能是不同会话，
+ *   不能全局只留一个最高版本）；
+ * - 扁平 `session-<uuid>.jsonl.zstd` / `<uuid>.jsonl.zstd`：一个文件就是一个独立会话，
+ *   全部保留、**不折叠**（导出 dump 的布局）；
+ * - 两种混放时各按各自的规则处理（版本化折叠成一个，扁平的照收）。
+ *
+ * 排序键一律用逻辑路径（R4 确定性）。
  */
 function buildGroups(collected: CollectedSessions): DispatchGroup[] {
   const groups: DispatchGroup[] = [];
@@ -263,7 +278,14 @@ function buildGroups(collected: CollectedSessions): DispatchGroup[] {
     const files = collected.dshByDir.get(dir) as SessionSource[];
     const byLogical = new Map(files.map((file) => [file.logicalPath, file]));
     const best = pickHighestVersionSessionFile(files.map((file) => file.logicalPath));
-    dshFiles.push((best !== undefined ? byLogical.get(best) : undefined) ?? files[0]!);
+    const versioned = best !== undefined ? byLogical.get(best) : undefined;
+    if (versioned !== undefined) dshFiles.push(versioned);
+    const flat = files
+      .filter((file) => sessionFileVersion(file.logicalPath) === undefined)
+      .sort((a, b) =>
+        a.logicalPath < b.logicalPath ? -1 : a.logicalPath > b.logicalPath ? 1 : 0,
+      );
+    dshFiles.push(...flat);
   }
   if (dshFiles.length > 0) groups.push({ kind: 'dsh', files: dshFiles });
   if (collected.ccFiles.length > 0) {
@@ -406,7 +428,7 @@ function dispatchDirectory(
     skippedDuplicates += expanded.skippedDuplicates ?? 0;
   }
   if (groups.length === 0 && errors.length === 0 && skippedDuplicates === 0) {
-    errors.push(`目录内没有会话文件（.zstd/.jsonl 或 .tar.zst 等归档）：${dir}`);
+    errors.push(`目录内没有会话文件（*.jsonl.zstd / *.jsonl 或 .tar.zst 等归档）：${dir}`);
   }
   return { groups, archives, errors, skippedDuplicates };
 }

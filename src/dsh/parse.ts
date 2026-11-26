@@ -55,8 +55,27 @@ export const MIN_SUPPORTED_FORMAT_VERSION = 4;
 /** `session.jsonl.zstd`（无 `.vN`）是 v0（RESEARCH §5）。 */
 export const IMPLICIT_SESSION_FILE_VERSION = 0;
 
-/** 会话容器文件名：`session.vN.jsonl.zstd`；`session.jsonl.zstd` = v0。 */
+/** 版本化会话容器文件名：`session.vN.jsonl.zstd`；`session.jsonl.zstd` = v0。 */
 const SESSION_FILE_PATTERN = /^session(?:\.v(\d+))?\.jsonl\.zstd$/i;
+
+/**
+ * 会话容器统一后缀：zstd 里装的是 jsonl 行。
+ *
+ * 真实数据里文件名有两种布局（本机实证）：
+ * - 版本化：`session.vN.jsonl.zstd`（`~/.dsh/sessions/<ws>/<sessionId>/` 布局，
+ *   同目录多版本只读最高 vN，DESIGN §5）；
+ * - 扁平：`session-<uuid>.jsonl.zstd` / `<uuid>.jsonl.zstd`（导出 dump 布局，
+ *   一个文件就是一个会话，**不折叠**）。
+ *
+ * 版本一律按记录判（AGENTS：不按文件级判版），所以这里只判「是不是容器」，
+ * 文件名里有没有版本号由 `sessionFileVersion` 单独回答（扁平命名回答 undefined）。
+ */
+export const DSH_CONTAINER_SUFFIX = '.jsonl.zstd';
+
+/** 是否是 DSH 会话容器（只看容器后缀，不看主干命名）。 */
+export function isDshSessionContainer(fileName: string): boolean {
+  return basename(fileName).toLowerCase().endsWith(DSH_CONTAINER_SUFFIX);
+}
 
 /** 事件缺 `type` 时的记录类型标记（不猜、不丢，按未知事件计数）。 */
 const MISSING_TYPE_RECORD = '<missing-type>';
@@ -393,20 +412,30 @@ export function resolveSessionSource(source: string | SessionSource): SessionSou
 }
 
 /**
- * 把调用方传的输入路径规范化成一个会话文件：目录则取其中最高版本文件，
- * 文件则原样返回（DESIGN §7：不做自动扫盘，目录内选择按版本规则）。
+ * 把调用方传的输入路径规范化成一个会话文件。
+ * - 文件：原样返回（DESIGN §7：不做自动扫盘）；
+ * - 目录：版本化 `session.vN.jsonl.zstd` 取最高 vN（DESIGN §5）；
+ *   目录里只有扁平命名（`session-<uuid>` / `<uuid>`）时，恰好一个就用它，
+ *   多个则抛错——扁平布局下「一个目录」不再等于「一个会话」，猜哪个都是错，
+ *   批量场景请直接给 `parseDshSessions` 传多个文件（它不做目录扫描）。
  */
 export function resolveSessionInput(path: string): string {
   const info = statSync(path);
   if (!info.isDirectory()) return path;
-  const candidates = readdirSync(path)
-    .filter((name) => SESSION_FILE_PATTERN.test(name))
+  const containers = readdirSync(path)
+    .sort()
+    .filter((name) => isDshSessionContainer(name))
     .map((name) => join(path, name));
-  const best = pickHighestVersionSessionFile(candidates);
-  if (best === undefined) {
-    throw new Error(`目录内没有 session.v*.jsonl.zstd：${path}`);
+  const best = pickHighestVersionSessionFile(containers);
+  if (best !== undefined) return best;
+  if (containers.length === 1) return containers[0] as string;
+  if (containers.length === 0) {
+    throw new Error(`目录内没有 session 容器（*.jsonl.zstd）：${path}`);
   }
-  return best;
+  throw new Error(
+    `目录内有 ${containers.length} 个扁平命名的会话容器，一个目录不再等于一个会话；` +
+      `请逐个传文件，或用 parseDshSessions 一次收多个：${path}`,
+  );
 }
 
 /** 真实布局里会话文件名就是版本名（`session.vN.jsonl.zstd`），会话标识只在目录名上。 */
