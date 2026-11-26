@@ -942,9 +942,20 @@ describe('parseCcSession：文件入口与重写副本跳过', () => {
   it('isCcSkippedSessionFile 识别 .orphaned-* / .superseded-*', () => {
     expect(isCcSkippedSessionFile('.orphaned-abc.jsonl')).toBe(true);
     expect(isCcSkippedSessionFile('C:\\p\\.superseded-x.jsonl')).toBe(true);
+    expect(isCcSkippedSessionFile('C:/p/.superseded-x.jsonl')).toBe(true);
+    expect(isCcSkippedSessionFile('/tmp/.orphaned-x.jsonl')).toBe(true);
     expect(isCcSkippedSessionFile('.ORPHANED-abc.jsonl')).toBe(true);
     expect(isCcSkippedSessionFile('abc.jsonl')).toBe(false);
     expect(isCcSkippedSessionFile('my.orphaned-note.jsonl')).toBe(false);
+  });
+
+  it('Windows 分隔符的逻辑路径：文件名只取最后一段（不依赖运行平台的 basename）', () => {
+    const file = tempFile('win-sess.jsonl', ['{}']);
+    const tree = parseCcSession({
+      physicalPath: file,
+      logicalPath: 'C:\\dump\\win-sess.jsonl',
+    });
+    expect(tree.sessionId).toBe('win-sess');
   });
 
   it('重写副本整文件跳过：产仅统计的会话树，行数计 skippedRecords（R7）', () => {

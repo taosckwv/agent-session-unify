@@ -30,7 +30,6 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { basename } from 'node:path';
 import { sha256Hex } from '../core/ids.js';
 import {
   asSessionSource,
@@ -147,10 +146,22 @@ interface CompactBoundaryState {
   uuid?: string;
 }
 
-/** 该文件是否是 CC 的 `.orphaned-*` / `.superseded-*` 重写副本（整文件跳过）。 */
+/**
+ * 该文件是否是 CC 的 `.orphaned-*` / `.superseded-*` 重写副本（整文件跳过）。
+ *
+ * 取文件名时**两种分隔符都认**：`node:path` 的 basename 按运行平台判，
+ * POSIX 上 `C:\p\.orphaned-x.jsonl` 会把整个串当文件名（真实报错案例）。
+ * 逻辑路径可能来自任意平台的归档成员，所以这里不依赖平台 path 实现。
+ */
 export function isCcSkippedSessionFile(filePath: string): boolean {
-  const name = basename(filePath).toLowerCase();
+  const name = ccFileNameOf(filePath).toLowerCase();
   return REWRITE_FILE_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+
+/** 取文件名（`/` 与 `\` 都当分隔符；不依赖运行平台）。 */
+function ccFileNameOf(filePath: string): string {
+  const cut = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+  return cut >= 0 ? filePath.slice(cut + 1) : filePath;
 }
 
 /**
@@ -1010,7 +1021,8 @@ function countRecords(text: string): number {
 }
 
 function sessionIdFromFileName(filePath: string): string {
-  const name = basename(filePath);
+  // 同一理由（见 isCcSkippedSessionFile）：逻辑路径可能带 Windows 分隔符。
+  const name = ccFileNameOf(filePath);
   const stem = name.replace(/\.jsonl$/i, '');
   return stem.length > 0 ? stem : name;
 }
