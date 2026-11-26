@@ -62,8 +62,8 @@ describe('redactString — 凭据前缀规则（DESIGN §8 规则 1）', () => {
   });
 });
 
-describe('redactString — 只在字符串开头认前缀（AGENTS：路径/代码/对话正文保留）', () => {
-  it('正文里引用前缀字样但非凭据开头时保留原文（最小规则集刻意保守）', () => {
+describe('redactString — 前缀凭据：整串形态（规则 ①）与正文 token 形态（规则 ③f）', () => {
+  it('正文里引用前缀字样但没有凭据体时保留原文（保守，不误杀）', () => {
     const text = '请在请求头里加 Authorization: Bearer <token>，token 放配置文件';
     expect(redactString(text)).toBe(text);
   });
@@ -132,6 +132,112 @@ describe('redactObject — 敏感字段值规则（DESIGN §8 规则 2）', () =
     const obj = { token: 123, n: null, b: false, apiKey: true, nested: { secret: 456 } };
     const out = redactObject(obj);
     expect(out).toEqual(obj);
+  });
+});
+
+describe('redactString — 自由文本口令（规则 ③，2026-11-26 真实案例）', () => {
+  const SECRET = 'eds@1234sangfornetwork';
+  const PLACEHOLDER = `${ASU_REDACTED_PREFIX}.${hashPlaceholder(SECRET)}`;
+
+  it('关键词赋值：标签保留、口令换成占位符（对话正文原样其余部分）', () => {
+    const out = redactString(`ssh root@10.1.1.1\n密码：${SECRET}`);
+    expect(out).toBe(`ssh root@10.1.1.1\n密码：${PLACEHOLDER}`);
+    expect(out).not.toContain(SECRET);
+  });
+
+  it.each([
+    [`password: ${SECRET}`, `password: ${PLACEHOLDER}`],
+    [`口令是 ${SECRET}，记得改`, `口令是 ${PLACEHOLDER}，记得改`],
+    [`"pwd": "${SECRET}"`, `"pwd": "${PLACEHOLDER}"`],
+    [`密码=${SECRET}`, `密码=${PLACEHOLDER}`],
+  ])('关键词/标点变体都能认（%s）', (input, expected) => {
+    expect(redactString(input)).toBe(expected);
+  });
+
+  it('sshpass -p / 命令行参数 / 连接串 userinfo 都脱口令', () => {
+    expect(redactString(`sshpass -p '${SECRET}' ssh root@10.1.1.1`)).toBe(
+      `sshpass -p '${PLACEHOLDER}' ssh root@10.1.1.1`,
+    );
+    expect(redactString('deploy --token=abcdef123456 --password="hello1234"')).toBe(
+      `deploy --token=${ASU_REDACTED_PREFIX}.${hashPlaceholder('abcdef123456')} ` +
+        `--password="${ASU_REDACTED_PREFIX}.${hashPlaceholder('hello1234')}"`,
+    );
+    expect(redactString('mysql://root:MyPass123@db.internal:3306/app')).toBe(
+      `mysql://root:${ASU_REDACTED_PREFIX}.${hashPlaceholder('MyPass123')}@db.internal:3306/app`,
+    );
+  });
+
+  it('裸密码形态（字母@数字、@ 后无点）即使没有关键词也脱口令', () => {
+    const out = redactString(`把 ${SECRET} 这串贴过来`);
+    expect(out).toBe(`把 ${PLACEHOLDER} 这串贴过来`);
+  });
+
+  it('同一口令同一占位符（可对账；与已验证的 hash 算法一致）', () => {
+    const a = redactString(`密码：${SECRET}`);
+    const b = redactString(`password is not matched but 密码：${SECRET}`);
+    expect(a).toContain(PLACEHOLDER);
+    expect(b).toContain(PLACEHOLDER);
+  });
+
+  it('幂等：再脱一次不变', () => {
+    const once = redactString(`密码：${SECRET}`);
+    expect(redactString(once)).toBe(once);
+  });
+
+  it.each([
+    ['密码是错的'], // 无 ASCII 字母，不是凭据形态
+    ['password: required'], // 值不像凭据
+    ['user@example.com'], // 邮箱：@ 后有点
+    ['root@10.1.1.1'], // 用户名@主机：@ 后有点
+    ['邮箱 a@123.com 保留'], // 邮箱前缀形似口令，但后面跟点，不误杀
+    ['请把 token 放进配置文件'], // 无锚点、无值
+  ])('不像凭据的正文原样保留（%s）', (input) => {
+    expect(redactString(input)).toBe(input);
+  });
+
+  it('占位符不含任何原文片段（脱敏的是口令本身）', () => {
+    const out = redactString(`密码：${SECRET}`);
+    expect(out).not.toContain('eds@');
+    expect(out).not.toContain('sangfornetwork');
+    expect(out).toContain(ASU_REDACTED_PREFIX);
+  });
+
+  it('已知前缀的凭据粘在正文里也脱口令（sk-/ghp_/Bearer）', () => {
+    const sk = 'sk-liveabcdefghijklmnop1234';
+    expect(redactString(`the key is ${sk} ok`)).toBe(
+      `the key is ${ASU_REDACTED_PREFIX}.${hashPlaceholder(sk)} ok`,
+    );
+    const gh = `ghp_${'a'.repeat(36)}`;
+    const ghOut = redactString(`token ${gh}`);
+    expect(ghOut).not.toContain(gh);
+    expect(ghOut).toContain(ASU_REDACTED_PREFIX);
+    const bearer = 'Bearer eyJhbGciOiJIUzI1NiJ9.abcdefg';
+    const bearerOut = redactString(`Authorization: ${bearer}`);
+    expect(bearerOut.startsWith(`Authorization: Bearer ${ASU_REDACTED_PREFIX}.`)).toBe(true);
+    expect(bearerOut).not.toContain('eyJhbGci');
+  });
+
+  it('模板插值与文档占位不当字面口令（配置正文原样保留）', () => {
+    const dsn =
+      'postgres://${DB_USER:-vs_pg_admin}:${DB_PASSWORD:?未设置：请先在 .env 中填写数据库口令}@postgres:5432/db';
+    expect(redactString(dsn)).toBe(dsn);
+    const envLine =
+      '      DB_PASSWORD: ${DB_PASSWORD:?未设置：请先在 .env 中填写数据库口令（键名见 .env.example）}';
+    expect(redactString(envLine)).toBe(envLine);
+    expect(redactString('deploy --token <jwt> --password <password>')).toBe(
+      'deploy --token <jwt> --password <password>',
+    );
+    expect(redactString("sshpass -p '<password>' ssh root@host")).toBe(
+      "sshpass -p '<password>' ssh root@host",
+    );
+  });
+
+  it('带引号的纯字母口令也脱敏（锚点+引号已足够定性）', () => {
+    expect(redactString('DB_PASSWORD: "sangfornetwork"')).toBe(
+      `DB_PASSWORD: "${ASU_REDACTED_PREFIX}.${hashPlaceholder('sangfornetwork')}"`,
+    );
+    // 纯中文值没有 ASCII 字母，仍按正文保留
+    expect(redactString('密码："请输入正确密码"')).toBe('密码："请输入正确密码"');
   });
 });
 

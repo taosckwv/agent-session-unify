@@ -5,8 +5,8 @@
  * - 脱敏只在组装层做（spanBuilder 是唯一入口），dsh/cc/otlp 不 import redact；
  * - 落盘字节里不得出现真实凭据形态（sk-/AKIA/ghp_/xox/Bearer/JWT）；
  * - 命中必须替换成 `asu.redacted.<hash>` 占位符，且路径/代码/对话正文保留；
- * - 已知限制（V1 不覆盖）：argsText 中段、非串首前缀的凭据不替换——单列记录，
- *   不计为验收通过项，也不掩盖。
+ * - 已知限制（V1 不覆盖）：仅靠「像凭据」推测的自由文本（无锚点、无前缀）不替换；
+ *   单列记录，不计为验收通过项，也不掩盖。
  *
  * 运行：npx vitest run tests/integration/redaction.test.ts
  */
@@ -147,16 +147,13 @@ describe('脱敏：落盘字节不得出现真实凭据形态', () => {
   });
 });
 
-describe('脱敏已知限制（V1 不覆盖，记录而不掩盖）', () => {
+describe('脱敏覆盖：tool_use.input（argsText 中段）里的凭据', () => {
   /**
-   * DESIGN §8 已声明的已知风险：`gen_ai.tool.call.arguments` 是 JSON 串
-   * （以 `{` 开头），而 redactString 只按「整串前缀」匹配凭据，所以写在
-   * tool_use.input 里的凭据会原样落盘。
-   *
-   * 这个用例**证明限制存在**：将来若补齐中段/嵌套脱敏，本用例会转红，
-   * 提醒改成正向断言（`findCredentialLeaks === []`）。
+   * DESIGN §8 曾把「`gen_ai.tool.call.arguments` 是 JSON 串（以 `{` 开头）、
+   * 只按整串前缀匹配」列为已知风险。规则 ③f 按 token 形态替换正文里的
+   * 已知前缀凭据后，该风险已关闭，这里从「记录限制」转成正向验收。
    */
-  it.fails('已知限制：tool_use.input（argsText 中段）里的凭据未脱敏', () => {
+  it('tool_use.input 里的 sk- 凭据落盘时已换成占位符', () => {
     const work = workDir('asu-int-redact-limit-');
     const ccDir = join(work, 'cc');
     mkdirSync(ccDir, { recursive: true });

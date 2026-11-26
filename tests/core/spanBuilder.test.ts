@@ -436,9 +436,11 @@ describe('buildSpans — 脱敏（§4.4 唯一入口）', () => {
     expect(map.get('asu.session.id')).toEqual({
       stringValue: `${ASU_REDACTED_PREFIX}.${hashPlaceholder('sk-supersecret12345')}`,
     });
-    // span 名 'session sk-…' 不以凭据前缀开头（t2 redactString 只匹配串首前缀）：
-    // 冻结行为——名不替换，属性值替换。以本测试钉住该口径。
-    expect((allSpans(tree)[0] as Span).name).toBe('session sk-supersecret12345');
+    // span 名里也带同一个 session id。规则 ③f（2026-11-26）起，正文/名字里
+    // 的已知前缀凭据按 token 就地替换——名与属性值口径一致，都替换。
+    expect((allSpans(tree)[0] as Span).name).toBe(
+      `session ${ASU_REDACTED_PREFIX}.${hashPlaceholder('sk-supersecret12345')}`,
+    );
   });
 
   it('输入树不被修改（纯函数，不原地脱敏）', () => {
